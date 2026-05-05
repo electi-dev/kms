@@ -185,7 +185,7 @@ tfhe-csprng = "=0.8.1"  # Cryptographically secure PRNG for TFHE - LOW RISK: Zam
 tfhe-versionable = "=0.7.0"  # TFHE versioning support - LOW RISK: Zama
 tfhe-zk-pok = "=0.8.0"  # Zero-knowledge proofs for TFHE - LOW RISK: Zama
 thiserror = "=2.0.12"  # Error derive macro - MEDIUM RISK: Reputable individual maintainer (dtolnay), 545M downloads
-tokio = { version = "=1.49.0", features = ["full"] }  # Async runtime - LOW RISK: tokio team, industry standard
+tokio = { version = "=1.50.0", features = ["full"] }  # Async runtime - LOW RISK: tokio team, industry standard
 tokio-rustls = { version = "=0.26.2", default-features = false, features = ["aws_lc_rs"] }  # Async TLS - LOW RISK: rustls team, memory-safe TLS implementation
 tokio-util = { version = "=0.7.18", features = ["rt"] }  # Tokio utilities - LOW RISK: tokio team
 tonic = "=0.13.1"  # gRPC framework - LOW RISK: hyperium team
