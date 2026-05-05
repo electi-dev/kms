@@ -2,7 +2,15 @@
 
 ################################################################
 ## Second stage builds the kms-core binaries
-FROM --platform=$BUILDPLATFORM ghcr.io/zama-ai/kms/rust-golden-image:latest AS kms-core
+FROM --platform=$BUILDPLATFORM rust:latest AS kms-core
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    libssl-dev \
+    protobuf-compiler \
+    clang 
 
 # By default, cargo build --release.
 # But you can provide --build-arg LTO_RELEASE="--profile release-lto-off" locally to build locally
@@ -47,7 +55,7 @@ RUN wget -qO/usr/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_V
 ################################################################
 ## Third stage: Copy the binaries from preceding stages
 # This stage will be the final image
-FROM --platform=$BUILDPLATFORM cgr.dev/zama.ai/glibc-dynamic:15.2.0-dev AS prod
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/glibc-dynamic:latest-dev AS prod
 
 USER root
 # Install required runtime dependencies
@@ -90,7 +98,7 @@ CMD ["/bin/bash", "/app/kms/core/service/bin/init_enclave.sh"]
 
 ################################################################
 # Build the grpc-health-probe binary for development
-FROM cgr.dev/zama.ai/golang:1.25 AS go-builder
+FROM cgr.dev/chainguard/go:latest AS go-builder
 
 ARG GRPC_HEALTH_PROBE_VERSION=v0.4.46
 

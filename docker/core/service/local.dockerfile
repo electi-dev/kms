@@ -2,7 +2,7 @@
 
 ################################################################
 # First stage based on the golden image
-FROM --platform=$BUILDPLATFORM ghcr.io/zama-ai/kms/rust-golden-image:latest AS kms-server
+FROM --platform=$BUILDPLATFORM rust:latest AS kms-server
 
 WORKDIR /app/kms
 COPY . .
@@ -14,7 +14,7 @@ RUN cargo install --locked --path core/service --root . --bin kms-server -F inse
 
 ################################################################
 # Second stage: Copy the binaries from the base stage and the go-runtime stage
-FROM --platform=$BUILDPLATFORM cgr.dev/zama.ai/glibc-dynamic:15.2.0-dev AS prod
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/glibc-dynamic:latest-dev AS prod
 
 USER root
 # Install required runtime dependencies
@@ -41,7 +41,7 @@ CMD ["kms-server", "centralized"]
 
 ################################################################
 # Third stage: Build the grpc-health-probe binary for development
-FROM cgr.dev/zama.ai/golang:1.25 AS go-builder
+FROM cgr.dev/chainguard/go:latest AS go-builder
 
 ARG GRPC_HEALTH_PROBE_VERSION=v0.4.46
 

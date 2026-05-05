@@ -2,7 +2,7 @@
 
 ################################################################
 ## Second stage builds the kms-core binaries
-FROM --platform=$BUILDPLATFORM ghcr.io/zama-ai/kms/rust-golden-image:latest AS kms-threshold
+FROM --platform=$BUILDPLATFORM rust:latest AS kms-threshold
 
 WORKDIR /app/ddec
 # Copy project files
@@ -18,7 +18,7 @@ RUN cargo install --locked --path core/threshold --root . --bins --no-default-fe
 
 
 # Go tooling stage - only for grpc-health-probe
-FROM cgr.dev/zama.ai/golang:1.25 AS go-builder
+FROM cgr.dev/chainguard/go:latest AS go-builder
 
 ARG GRPC_HEALTH_PROBE_VERSION=v0.4.46
 
@@ -30,7 +30,7 @@ RUN git clone https://github.com/grpc-ecosystem/grpc-health-probe && \
 
 
 
-FROM --platform=$BUILDPLATFORM cgr.dev/zama.ai/glibc-dynamic:15.2.0-dev AS prod
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/glibc-dynamic:latest-dev AS prod
 
 USER root
 # Install required runtime dependencies
