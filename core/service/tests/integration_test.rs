@@ -1,16 +1,14 @@
-use assert_cmd::{assert::OutputAssertExt, Command};
+use assert_cmd::{Command, assert::OutputAssertExt};
 use kms_lib::consts::{
     KEY_PATH_PREFIX, PRIVATE_STORAGE_PREFIX_THRESHOLD_ALL, PUBLIC_STORAGE_PREFIX_THRESHOLD_ALL,
 };
-use kms_lib::vault::storage::{file::FileStorage, StorageType};
-use std::os::unix::fs::PermissionsExt;
+use kms_lib::vault::storage::{StorageType, file::FileStorage};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::{fs, thread, time::Duration};
 use sysinfo::System;
-use tests_utils::integration_test;
-use tests_utils::persistent_traces;
-use threshold_fhe::conf::party::CertificatePaths;
+use test_utils_service::integration_test;
+use test_utils_service::persistent_traces;
 
 const KMS_SERVER: &str = "kms-server";
 const KMS_GEN_KEYS: &str = "kms-gen-keys";
@@ -26,14 +24,22 @@ fn kill_process(process_name: &str) {
 
     for (pid, process) in sys.processes() {
         // exe returns the path to the process
-        if let Some(path) = process.exe() {
-            if let Some(s) = path.to_str() {
-                if s.contains(process_name) {
-                    println!(
-                        "killing process {process_name} with pid {pid}: ok={}",
-                        process.kill()
-                    );
-                }
+        if let Some(path) = process.exe()
+            && let Some(s) = path.to_str()
+            && s.contains(process_name)
+        {
+            if process.kill() {
+                tracing::info!(
+                    process_name = %process_name,
+                    pid = %pid,
+                    "Killed matching process during integration test cleanup"
+                );
+            } else {
+                tracing::warn!(
+                    process_name = %process_name,
+                    pid = %pid,
+                    "Failed to kill matching process during integration test cleanup"
+                );
             }
         }
     }
@@ -112,6 +118,21 @@ mod kms_gen_keys_binary_test {
     use tokio::fs::read_dir;
 
     use super::*;
+
+    fn kms_gen_keys_command() -> Command {
+        let mut command = Command::cargo_bin(KMS_GEN_KEYS).unwrap();
+        // Integration tests run with quiet-by-default test logging, but these
+        // subprocess assertions intentionally depend on child `info!` output.
+        // Clear inherited filter overrides so the child's verbose preset wins.
+        // To override this for debugging, set `KMS_TEST_LOG_CONSOLE_FILTER`
+        // on this command with the same syntax as `RUST_LOG`.
+        command
+            .env("KMS_TEST_LOG_MODE", "verbose")
+            .env_remove("KMS_TEST_LOG_FILTER")
+            .env_remove("KMS_TEST_LOG_CONSOLE_FILTER")
+            .env_remove("RUST_LOG");
+        command
+    }
 
     #[test]
     #[integration_test]
@@ -217,8 +238,7 @@ mod kms_gen_keys_binary_test {
     #[serial_test::serial]
     #[integration_test]
     fn central_signing_keys_overwrite() {
-        let output = Command::cargo_bin(KMS_GEN_KEYS)
-            .unwrap()
+        let output = kms_gen_keys_command()
             .arg("--param-test")
             .arg("--cmd=signing-keys")
             .arg("--overwrite")
@@ -233,8 +253,7 @@ mod kms_gen_keys_binary_test {
             "Successfully stored public centralized server signing key under the handle"
         ));
 
-        let new_output = Command::cargo_bin(KMS_GEN_KEYS)
-            .unwrap()
+        let new_output = kms_gen_keys_command()
             .arg("--param-test")
             .arg("--cmd=signing-keys")
             .arg("centralized")
@@ -251,8 +270,7 @@ mod kms_gen_keys_binary_test {
     fn central_signing_address_format() {
         let temp_dir_priv = tempdir().unwrap();
         let temp_dir_pub = tempdir().unwrap();
-        let output = Command::cargo_bin(KMS_GEN_KEYS)
-            .unwrap()
+        let output = kms_gen_keys_command()
             .arg("--param-test")
             .arg("--private-storage=file")
             .arg("--private-file-path")
@@ -309,8 +327,10 @@ mod kms_gen_keys_binary_test {
             .unwrap();
 
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr)
-            .contains("the number of parties should be larger or equal to 2"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("the number of parties should be larger or equal to 2")
+        );
     }
 
     #[test]
@@ -337,8 +357,10 @@ mod kms_gen_keys_binary_test {
             .unwrap();
 
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr)
-            .contains("party ID (5) cannot be greater than num_parties (4)"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("party ID (5) cannot be greater than num_parties (4)")
+        );
     }
 
     #[test]
@@ -350,8 +372,7 @@ mod kms_gen_keys_binary_test {
         let temp_dir_pub = tempdir().unwrap();
 
         // finally we run the command with the right args
-        let output = Command::cargo_bin(KMS_GEN_KEYS)
-            .unwrap()
+        let output = kms_gen_keys_command()
             .arg("--private-storage=file")
             .arg("--private-file-path")
             .arg(temp_dir_priv.path())
@@ -366,8 +387,10 @@ mod kms_gen_keys_binary_test {
             .unwrap();
 
         assert!(output.status.success());
-        assert!(String::from_utf8_lossy(&output.stdout)
-            .contains("Successfully stored ethereum address 0x"));
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("Successfully stored ethereum address 0x")
+        );
     }
 
     #[cfg(feature = "s3_tests")]
@@ -379,8 +402,7 @@ mod kms_gen_keys_binary_test {
 
         // Test the following command:
         // cargo run --features testing  --bin kms-gen-keys -- --param-test --aws-region eu-north-1 --public-storage=s3 --public-s3-bucket ci-kms-key-test --public-s3-prefix=central_s3 --private-storage=file --private-file-path=./temp/keys/ --cmd=signing-keys --overwrite --deterministic
-        let output = Command::cargo_bin(KMS_GEN_KEYS)
-            .unwrap()
+        let output = kms_gen_keys_command()
             .arg("--param-test")
             .arg(format!("--aws-region={AWS_REGION}"))
             .arg(format!("--aws-s3-endpoint={AWS_S3_ENDPOINT}"))
@@ -400,8 +422,14 @@ mod kms_gen_keys_binary_test {
             .unwrap();
         let log = String::from_utf8_lossy(&output.stdout);
         let err_log = String::from_utf8_lossy(&output.stderr);
-        println!("Command output: {log}");
-        println!("Command error output: {err_log}");
+        if !output.status.success() {
+            tracing::error!(
+                status = %output.status,
+                stdout = %log,
+                stderr = %err_log,
+                "kms-gen-keys centralized S3 integration command failed"
+            );
+        }
         assert!(output.status.success());
         assert!(log.contains("Successfully stored public centralized server signing key under the handle 60b7070add74be3827160aa635fb255eeeeb88586c4debf7ab1134ddceb4beee in storage \"S3 storage with"));
         assert!(log.contains("Successfully stored private centralized server signing key under the handle 60b7070add74be3827160aa635fb255eeeeb88586c4debf7ab1134ddceb4beee in storage \"file storage with"));
@@ -442,7 +470,25 @@ mod kms_server_binary_test {
                 .arg(config_file)
                 .output();
             // Debug output of failing tests
-            println!("Command output: {out:?}");
+            match out {
+                Ok(ref output) if !output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::error!(
+                        status = %output.status,
+                        stdout = %stdout,
+                        stderr = %stderr,
+                        "kms-server integration command exited unexpectedly"
+                    );
+                }
+                Err(ref err) => {
+                    tracing::error!(
+                        error = %err,
+                        "Failed to capture kms-server subprocess output in integration test"
+                    );
+                }
+                _ => {}
+            }
         });
 
         thread::sleep(Duration::from_secs(5));
@@ -513,88 +559,24 @@ mod kms_server_binary_test {
             .success();
         run_subcommand_no_args("config/default_1.toml");
     }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_cert_paths() {
-        // make a temporary directory for the certificates
-        let all_rwx = std::fs::Permissions::from_mode(0o777);
-        let temp_dir = tempfile::Builder::new()
-            .prefix(
-                &std::env::current_dir()
-                    .unwrap()
-                    .as_path()
-                    .join("cert-paths-test"),
-            )
-            .permissions(all_rwx)
-            .tempdir()
-            .unwrap();
-        let actual_permissions = temp_dir.path().metadata().unwrap().permissions();
-        println!(
-            "temp_dir path: {:?}, permission: {:o}",
-            temp_dir.path(),
-            actual_permissions.mode()
-        );
-
-        // Note that we're testing the type `CertificatePaths`
-        // which is from core/threshold but using the binary in core/service.
-        Command::cargo_bin(KMS_GEN_TLS_CERTS)
-            .unwrap()
-            .args([
-                "--ca-prefix=p",
-                "--ca-count=4",
-                "-o",
-                temp_dir.path().to_str().unwrap(),
-            ])
-            .output()
-            .expect("failed to execute process");
-
-        let cert_path = temp_dir.path().join("cert_p1.pem");
-        let key_path = temp_dir.path().join("key_p1.pem");
-
-        let cert_paths = CertificatePaths {
-            cert: cert_path.to_str().unwrap().to_string(),
-            key: key_path.to_str().unwrap().to_string(),
-            calist: [
-                "cert_p1.pem,",
-                "cert_p2.pem,",
-                "cert_p3.pem,",
-                "cert_p4.pem",
-            ]
-            .map(|suffix| temp_dir.path().join(suffix).to_str().unwrap().to_string())
-            .concat(),
-        };
-
-        assert!(cert_paths.get_certificate().is_ok());
-        assert!(cert_paths.get_identity().is_ok());
-        assert!(cert_paths.get_flattened_ca_list().is_ok());
-        for i in 0..4 {
-            // note that party IDs start at 1
-            let pid = i + 1;
-            assert!(cert_paths.get_ca_by_name(&format!("p{pid}")).is_ok());
-        }
-        assert!(cert_paths.get_ca_by_name("p5").is_err());
-
-        // using localhost should fail too because it's not a part of the issuer
-        assert!(cert_paths.get_ca_by_name("localhost").is_err());
-    }
 }
 
 #[cfg(test)]
 mod kms_custodian_binary_tests {
     use aes_prng::AesRng;
     use assert_cmd::Command;
-    use kms_grpc::{kms::v1::CustodianContext, RequestId};
+    use kms_grpc::{RequestId, kms::v1::CustodianContext};
     use kms_lib::{
         backup::{
+            KMS_CUSTODIAN, SEED_PHRASE_DESC,
             custodian::{
                 InternalCustodianContext, InternalCustodianRecoveryOutput,
                 InternalCustodianSetupMessage,
             },
             operator::{InternalRecoveryRequest, Operator, RecoveryValidationMaterial},
             seed_phrase::custodian_from_seed_phrase,
-            KMS_CUSTODIAN, SEED_PHRASE_DESC,
         },
+        consts::DEFAULT_MPC_CONTEXT,
         cryptography::{
             encryption::{
                 Encryption, PkeScheme, PkeSchemeType, UnifiedPrivateEncKey, UnifiedPublicEncKey,
@@ -607,9 +589,10 @@ mod kms_custodian_binary_tests {
     use rand::SeedableRng;
     use std::path::MAIN_SEPARATOR;
     use std::{collections::BTreeMap, path::Path, thread};
-    use threshold_fhe::execution::runtime::party::Role;
+    use threshold_types::role::Role;
 
     fn run_custodian_cli(commands: Vec<String>) -> String {
+        test_utils::test_logging::init_test_logging();
         let h = thread::spawn(|| {
             let mut cmd = Command::cargo_bin(KMS_CUSTODIAN).unwrap();
             for arg in commands {
@@ -623,7 +606,14 @@ mod kms_custodian_binary_tests {
         let out = h.join().unwrap().unwrap();
         let output_string = String::from_utf8_lossy(&out.stdout);
         let errors = String::from_utf8_lossy(&out.stderr);
-        println!("Command output: {output_string}");
+        if !out.status.success() || !errors.is_empty() {
+            tracing::error!(
+                status = %out.status,
+                stdout = %output_string,
+                stderr = %errors,
+                "kms-custodian integration command returned unexpected output"
+            );
+        }
         assert!(
             out.status.success(),
             "Command did not execute successfully: {} : {}",
@@ -673,7 +663,6 @@ mod kms_custodian_binary_tests {
         let _verf_out = run_custodian_cli(verf_command);
     }
 
-    #[tracing_test::traced_test]
     #[tokio::test]
     #[serial_test::serial]
     async fn sunshine_decrypt_custodian() {
@@ -741,6 +730,8 @@ mod kms_custodian_binary_tests {
                     custodian_index.to_string(),
                     "--operator-verf-key".to_string(),
                     operator_verf_path.to_str().unwrap().to_string(),
+                    "--mpc-context-id".to_string(),
+                    DEFAULT_MPC_CONTEXT.to_string(),
                     "-b".to_string(),
                     request_path.to_str().unwrap().to_string(),
                     "-o".to_string(),
@@ -843,20 +834,22 @@ mod kms_custodian_binary_tests {
         )
         .unwrap();
         let (backup_ske, backup_pke) = enc.keygen().unwrap();
-        let (ct_map, commitments) = operator
+        let signcrypt_result = operator
             .secret_share_and_signcrypt(
                 &mut rng,
                 &bc2wrap::serialize(&backup_ske).unwrap(),
                 backup_id,
             )
             .unwrap();
+        let ct_map = signcrypt_result.ct_shares;
+        let commitments = signcrypt_result.commitments;
         let custodian_context = InternalCustodianContext::new(
             CustodianContext {
                 custodian_nodes: setup_msgs
                     .iter()
                     .map(|cur| cur.to_owned().try_into().unwrap())
                     .collect(),
-                context_id: Some(backup_id.into()),
+                custodian_context_id: Some(backup_id.into()),
                 threshold: threshold as u32,
             },
             backup_pke,
@@ -867,6 +860,7 @@ mod kms_custodian_binary_tests {
             commitments.clone(),
             custodian_context,
             &signing_key,
+            *DEFAULT_MPC_CONTEXT,
         )
         .unwrap();
         let mut ciphertexts = BTreeMap::new();

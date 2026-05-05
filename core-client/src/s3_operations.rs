@@ -1,16 +1,19 @@
 use std::collections::HashMap;
 use std::{collections::HashSet, path::Path};
 
+use crate::{CoreClientConfig, CoreConf};
 use bytes::Bytes;
+#[cfg(feature = "testing")]
+use kms_grpc::rpc_types::PrivDataType;
 use kms_grpc::rpc_types::PubDataType;
 #[cfg(feature = "testing")]
 use kms_lib::cryptography::signatures::PrivateSigKey;
-use kms_lib::{
-    consts::{SAFE_SER_SIZE_LIMIT, SIGNING_KEY_ID},
-    cryptography::signatures::PublicSigKey,
+use kms_lib::vault::storage::file::FileStorage;
+use kms_lib::vault::storage::s3::{
+    S3Storage, build_anonymous_s3_client, find_region_from_s3_url, split_url,
 };
-
-use crate::{CoreClientConfig, CoreConf};
+use kms_lib::vault::storage::{StorageReader, StorageType};
+use kms_lib::{consts::SIGNING_KEY_ID, cryptography::signatures::PublicSigKey};
 
 /// Fetch all remote elements and store them locally for the core client
 /// Return the server IDs of all servers that were successfully contacted
@@ -52,7 +55,10 @@ pub async fn fetch_public_elements(
             .await
             .is_err()
             {
-                tracing::warn!("Could not fetch element {element_name} with id {element_id} from core at endpoint {}. At least one core is required to proceed.", cur_core.s3_endpoint);
+                tracing::warn!(
+                    "Could not fetch element {element_name} with id {element_id} from core at endpoint {}. At least one core is required to proceed.",
+                    cur_core.s3_endpoint
+                );
                 all_elements = false;
                 break 'elements;
             }
@@ -69,91 +75,82 @@ pub async fn fetch_public_elements(
 
     if successful_core_ids.is_empty() {
         Err(anyhow::anyhow!(
-                "Could not fetch all of [{element_types:?}] with id {element_id} from any core. At least one core is required to proceed."
-            ))
+            "Could not fetch all of [{element_types:?}] with id {element_id} from any core. At least one core is required to proceed."
+        ))
     } else {
         Ok(successful_core_ids.into_iter().collect())
     }
 }
 
-/// This fetches the KMS public verification keys from S3 for all the cores.
+/// This fetches the KMS public verification key from S3 for all the cores.
 pub(crate) async fn fetch_kms_verification_keys(
     sim_conf: &CoreClientConfig,
 ) -> anyhow::Result<HashMap<usize, PublicSigKey>> {
-    let key_id = &SIGNING_KEY_ID.to_string();
     let mut keys_map = HashMap::with_capacity(sim_conf.cores.len());
-
     for cur_core in &sim_conf.cores {
-        let content = generic_fetch_element(
-            &cur_core.s3_endpoint.clone(),
-            &format!(
-                "{}/{}",
-                cur_core.object_folder,
-                &PubDataType::VerfKey.to_string()
-            ),
-            key_id,
-        )
-        .await?;
-
-        let vk = tfhe::safe_serialization::safe_deserialize(
-            std::io::Cursor::new(&content),
-            SAFE_SER_SIZE_LIMIT,
-        )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to deserialize verification key for party {}: {}",
-                cur_core.party_id,
-                e
-            )
-        })?;
+        let (protocol, domain, bucket) = split_url(&cur_core.s3_endpoint)?;
+        let vk: PublicSigKey = if protocol == "file://" {
+            let storage = FileStorage::new(
+                Some(Path::new(&bucket)),
+                StorageType::PUB,
+                Some(&cur_core.object_folder),
+            )?;
+            storage
+                .read_data(&SIGNING_KEY_ID, &PubDataType::VerfKey.to_string())
+                .await?
+        } else {
+            let url = format!("{protocol}{domain}");
+            let region = find_region_from_s3_url(&url)?;
+            let s3_client = build_anonymous_s3_client(&url, region).await?;
+            let s3_storage = S3Storage::new(
+                s3_client,
+                bucket,
+                StorageType::PUB,
+                Some(&cur_core.object_folder),
+            )?;
+            s3_storage
+                .read_data(&SIGNING_KEY_ID, &PubDataType::VerfKey.to_string())
+                .await?
+        };
         keys_map.insert(cur_core.party_id, vk);
     }
 
     Ok(keys_map)
 }
 
-/// This fetches the KMS private signing keys from S3 for all the cores.
+/// This fetches the KMS private signing key from S3 for all the cores.
 #[cfg(feature = "testing")]
 pub(crate) async fn fetch_kms_signing_keys(
     sim_conf: &CoreClientConfig,
 ) -> anyhow::Result<HashMap<usize, PrivateSigKey>> {
-    let key_id = &SIGNING_KEY_ID.to_string();
     let mut keys_map = HashMap::with_capacity(sim_conf.cores.len());
-
     for cur_core in &sim_conf.cores {
-        use kms_grpc::rpc_types::PrivDataType;
-
-        let content = generic_fetch_element(
-            &cur_core.s3_endpoint.clone(),
-            &format!(
-                "{}/{}",
-                cur_core
-                    .private_object_folder
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "Private object folder not set for core {}",
-                        cur_core.party_id
-                    ))?,
-                &PrivDataType::SigningKey.to_string()
-            ),
-            key_id,
-        )
-        .await?;
-
-        let signing_key: PrivateSigKey = tfhe::safe_serialization::safe_deserialize(
-            std::io::Cursor::new(&content),
-            SAFE_SER_SIZE_LIMIT,
-        )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to deserialize signing key for party {}: {}",
-                cur_core.party_id,
-                e
-            )
-        })?;
-        keys_map.insert(cur_core.party_id, signing_key);
+        let (protocol, domain, bucket) = split_url(&cur_core.s3_endpoint)?;
+        let sk: PrivateSigKey = if protocol == "file://" {
+            let storage = FileStorage::new(
+                Some(Path::new(&bucket)),
+                StorageType::PRIV,
+                cur_core.private_object_folder.as_deref(),
+            )?;
+            storage
+                .read_data(&SIGNING_KEY_ID, &PrivDataType::SigningKey.to_string())
+                .await?
+        } else {
+            let url = format!("{protocol}{domain}");
+            let region = find_region_from_s3_url(&url)?;
+            let s3_client = build_anonymous_s3_client(&url, region).await?;
+            let s3_storage = S3Storage::new(
+                s3_client,
+                bucket,
+                StorageType::PRIV,
+                cur_core.private_object_folder.as_deref(),
+            )?;
+            s3_storage
+                .read_data(&SIGNING_KEY_ID, &PrivDataType::SigningKey.to_string())
+                .await?
+        };
+        keys_map.insert(cur_core.party_id, sk);
     }
-
     Ok(keys_map)
 }
 
@@ -206,7 +203,10 @@ async fn generic_fetch_element(
 
         if response.status().is_success() {
             let bytes = response.bytes().await?;
-            tracing::info!("Successfully downloaded {} bytes for element {element_id} from endpoint {endpoint}/{folder}", bytes.len());
+            tracing::info!(
+                "Successfully downloaded {} bytes for element {element_id} from endpoint {endpoint}/{folder}",
+                bytes.len()
+            );
             // Here you can process the bytes as needed
             Ok(bytes)
         } else {
@@ -231,11 +231,14 @@ async fn generic_fetch_element(
         let byte_res = tokio::fs::read(&key_path).await.map_err(|e| {
             anyhow::anyhow!(
                 "Failed to read bytes from file at {:?} with error: {e}",
-                &key_path
+                key_path
             )
         })?;
         let res = Bytes::from(byte_res);
-        tracing::info!("Successfully read {} bytes for element {element_id} from local path {local_path}/{folder}", res.len());
+        tracing::info!(
+            "Successfully read {} bytes for element {element_id} from local path {local_path}/{folder}",
+            res.len()
+        );
         Ok(res)
     }
 }
@@ -253,7 +256,7 @@ async fn write_bytes_to_file(
     tokio::fs::write(&path, data).await.map_err(|e| {
         anyhow::anyhow!(
             "Failed to write bytes to file at {:?} with error: {e}",
-            &path
+            path
         )
     })?;
     Ok(())

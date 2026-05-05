@@ -1,7 +1,7 @@
 use aes_prng::AesRng;
-use kms_grpc::{rpc_types::PubDataType, RequestId};
+use kms_grpc::{RequestId, rpc_types::PubDataType};
 use rand::SeedableRng;
-use threshold_fhe::execution::{
+use threshold_execution::{
     endpoints::decryption::DecryptionMode, tfhe_internals::parameters::DKGParams,
 };
 use tokio::task::JoinSet;
@@ -23,7 +23,7 @@ use crate::{
         rate_limiter::RateLimiterConfig,
     },
     vault::storage::{
-        file::FileStorage, read_context_at_id, read_versioned_at_request_id, StorageType,
+        StorageType, file::FileStorage, read_context_at_id, read_versioned_at_request_id,
     },
 };
 
@@ -116,7 +116,7 @@ async fn do_context_switch(
             .unwrap();
 
         let mut req_tasks = JoinSet::new();
-        for (_, client) in kms_clients.iter() {
+        for client in kms_clients.values() {
             let req_clone = req.clone();
             let mut client = client.clone();
             req_tasks.spawn(async move { client.new_mpc_context(req_clone).await });
@@ -148,7 +148,7 @@ async fn do_context_switch(
         None,
         1,
         None,
-        false, // compressed_keys
+        false, // test material uses compressed keys
     )
     .await;
 
@@ -159,7 +159,7 @@ async fn do_context_switch(
             .unwrap();
 
         let mut req_tasks = JoinSet::new();
-        for (_, client) in kms_clients.iter() {
+        for client in kms_clients.values() {
             let req_clone = req.clone();
             let mut client = client.clone();
             req_tasks.spawn(async move { client.destroy_mpc_context(req_clone).await });
@@ -188,7 +188,7 @@ async fn do_context_switch(
         1,
         None,
         true,
-        false, // compressed_keys
+        false, // test material uses compressed keys
     )
     .await;
 
@@ -206,7 +206,7 @@ async fn do_context_switch(
         None,
         1,
         None,
-        false, // compressed_keys
+        false, // test material uses compressed keys
     )
     .await;
 

@@ -1,52 +1,25 @@
-#![allow(unused_imports)]
-
 use crate::{
-    consts::{DEFAULT_EPOCH_ID, DEFAULT_MPC_CONTEXT},
     engine::{
-        base::{compute_info_standard_keygen, retrieve_parameters, BaseKmsStruct, KeyGenMetadata},
         context::ContextInfo,
-        threshold::service::{session::ImmutableSessionMaker, PublicKeyMaterial, ThresholdFheKeys},
         utils::{
-            verify_compressed_key_digest_from_bytes, verify_crs_digest_from_bytes,
-            verify_key_digest_from_bytes, MetricedError, ERR_COMPRESSED_KEYSET_DIGEST_MISMATCH,
-            ERR_SERVER_KEY_DIGEST_MISMATCH,
+            MetricedError, verify_compressed_key_digest_from_bytes, verify_crs_digest_from_bytes,
+            verify_key_digest_from_bytes,
         },
-        validation::{parse_grpc_request_id, parse_optional_grpc_request_id, RequestIdParsingErr},
     },
-    util::{meta_store::MetaStore, rate_limiter::RateLimiter},
     vault::storage::{
+        Storage, StorageExt, StorageReader, StorageType,
         crypto_material::ThresholdCryptoMaterialStorage,
         read_context_at_id,
         s3::{
-            build_anonymous_s3_client, ReadOnlyS3Storage, ReadOnlyS3StorageGetter,
-            RealReadOnlyS3StorageGetter,
+            ReadOnlyS3StorageGetter, build_anonymous_s3_client, find_region_from_s3_url, split_url,
         },
-        Storage, StorageExt, StorageReader, StorageType,
     },
 };
-use itertools::Itertools;
-use kms_grpc::{
-    kms::v1::{Empty, EpochResultResponse, KeyDigest, NewMpcEpochRequest},
-    rpc_types::{optional_protobuf_to_alloy_domain, PubDataType},
-    ContextId, EpochId, IdentifierError, RequestId,
-};
+use kms_grpc::{ContextId, RequestId, rpc_types::PubDataType};
 use observability::metrics_names::OP_NEW_EPOCH;
-use std::{collections::HashMap, sync::Arc};
-use tfhe::{xof_key_set::CompressedXofKeySet, zk::CompactPkeCrs, ServerKey};
-use threshold_fhe::{
-    execution::{
-        endpoints::reshare_sk::{
-            ResharePreprocRequired, ReshareSecretKeys, SecureReshareSecretKeys,
-        },
-        runtime::sessions::session_parameters::GenericParameterHandles,
-        small_execution::offline::{Preprocessing, SecureSmallPreprocessing},
-        tfhe_internals::public_keysets::FhePubKeySet,
-    },
-    networking::NetworkMode,
-};
-use tokio::sync::RwLock;
-use tokio_util::task::TaskTracker;
-use tonic::{Request, Response, Status};
+use std::collections::HashMap;
+use tfhe::{ServerKey, xof_key_set::CompressedXofKeySet, zk::CompactPkeCrs};
+use threshold_execution::tfhe_internals::public_keysets::FhePubKeySet;
 
 const ERR_FAILED_TO_FETCH_PUBLIC_MATERIALS: &str = "Failed to fetch public materials";
 
@@ -72,93 +45,6 @@ impl std::fmt::Debug for VerifiedPublicMaterial {
                 write!(f, "VerifiedPublicMaterial::Compressed(...)")
             }
         }
-    }
-}
-
-fn bucket_from_domain(url: &url::Url) -> anyhow::Result<String> {
-    let Some(domain) = url.domain() else {
-        anyhow::bail!("Cannot deduce the bucket name from url {:?}", url);
-    };
-    let domain_parts = domain.split('.').collect::<Vec<&str>>();
-    if domain_parts.len() < 2 {
-        tracing::warn!(
-            "Cannot deduce the bucket name from url {:?}. Returning default bucket used in testing",
-            url
-        );
-        Ok("kms".to_owned())
-    } else {
-        Ok(domain_parts[0].to_owned())
-    }
-}
-
-/// Find the AWS region from an S3 bucket URL.
-/// For example:
-/// The URL https://zama-zws-dev-tkms-b6q87.s3.eu-west-1.amazonaws.com/ will return "eu-west-1".
-pub(crate) fn find_region_from_s3_url(s3_bucket_url: &String) -> anyhow::Result<String> {
-    let parsed_url = url::Url::parse(s3_bucket_url.as_str())?;
-    let domain = parsed_url
-        .domain()
-        .ok_or(anyhow::anyhow!("Cannot parse domain from URL"))?;
-    let domain_parts: Vec<&str> = domain.split('.').collect();
-    if domain_parts.len() < 4 {
-        tracing::warn!(
-            "Cannot deduce the region from url {:?}. Using default us-east-1",
-            s3_bucket_url
-        );
-        return Ok("us-east-1".to_owned()); // default region
-    }
-    let dot_com_pos = domain_parts.len() - 1;
-    let expected_s3_pos = dot_com_pos - 3;
-    let expected_region_pos = dot_com_pos - 2;
-    // e.g s3.eu-west-1.amazonaws.com
-    if domain_parts[expected_s3_pos] == "s3" {
-        Ok(domain_parts[expected_region_pos].to_owned())
-    } else {
-        tracing::warn!(
-            "Cannot deduce the region from url {:?}. Using default us-east-1",
-            s3_bucket_url
-        );
-        Ok("us-east-1".to_owned()) // default region
-    }
-}
-
-/// Split an S3 URL into its base URL and bucket name.
-/// For example:
-/// The URL https://zama-zws-dev-tkms-b6q87.s3.eu-west-1.amazonaws.com/ will be split into
-/// https://s3.eu-west-1.amazonaws.com and zama-zws-dev-tkms-b6q87
-/// where the first part is the URL and the second part is the bucket name.
-///
-/// Code is adapted from
-/// https://github.com/zama-ai/fhevm/blob/dac153662361758c9a563e766473692f8acf1074/coprocessor/fhevm-engine/gw-listener/src/aws_s3.rs#L140C1-L174C1
-fn split_url(s3_bucket_url: &String) -> anyhow::Result<(String, String)> {
-    // e.g BBBBBB.s3.bla.bli.amazonaws.blu, the bucket is part of the domain
-    tracing::info!("Splitting S3 url: {}", s3_bucket_url);
-    let parsed_url_and_bucket = url::Url::parse(s3_bucket_url.as_str())?;
-    let mut bucket = parsed_url_and_bucket
-        .path()
-        .trim_start_matches('/')
-        .to_owned();
-
-    if bucket.is_empty() {
-        tracing::warn!(
-            "Bucket is empty, attempting to deduce from domain {:?}",
-            parsed_url_and_bucket
-        );
-        // e.g BBBBBB.s3.eu-west-1.amazonaws.com, the bucket is part of the domain
-        bucket = bucket_from_domain(&parsed_url_and_bucket)?;
-        let url = s3_bucket_url
-            .replace(&(bucket.clone() + "."), "")
-            .trim_end_matches('/')
-            .to_owned();
-        tracing::info!(s3_bucket_url, url, bucket, "Bucket from domain");
-        Ok((url, bucket))
-    } else {
-        let url = s3_bucket_url
-            .replace(&bucket, "")
-            .trim_end_matches('/')
-            .to_owned();
-        tracing::info!(s3_bucket_url, url, bucket, "Parsed S3 url");
-        Ok((url, bucket))
     }
 }
 
@@ -198,11 +84,12 @@ async fn fetch_public_fhe_materials_from_peers<
         //
         // the public storage URL consists of the bucket name and the URL
         // we need to parse this information accordingly
-        let (url, bucket) = split_url(&node.public_storage_url)?;
+        let (protocol, domain, bucket) = split_url(&node.public_storage_url)?;
+        let url = format!("{protocol}{domain}");
         let region = find_region_from_s3_url(&node.public_storage_url)?;
 
         // this is not an operation that is frequently used, so we can create a new s3 client each time
-        let s3_client = build_anonymous_s3_client(url::Url::parse(&url)?, region).await?;
+        let s3_client = build_anonymous_s3_client(&url, region).await?;
         let pub_storage = ro_storage_getter.get_storage(
             s3_client,
             bucket,
@@ -577,11 +464,12 @@ async fn fetch_public_crs_materials_from_peers<
         //
         // the public storage URL consists of the bucket name and the URL
         // we need to parse this information accordingly
-        let (url, bucket) = split_url(&node.public_storage_url)?;
+        let (protocol, domain, bucket) = split_url(&node.public_storage_url)?;
+        let url = format!("{protocol}{domain}");
         let region = find_region_from_s3_url(&node.public_storage_url)?;
 
         // this is not an operation that is frequently used, so we can create a new s3 client each time
-        let s3_client = build_anonymous_s3_client(url::Url::parse(&url)?, region).await?;
+        let s3_client = build_anonymous_s3_client(&url, region).await?;
         let pub_storage = ro_storage_getter.get_storage(
             s3_client,
             bucket,
@@ -705,9 +593,9 @@ mod tests {
     use crate::engine::context::ContextInfo;
     use crate::engine::context::NodeInfo;
     use crate::engine::context::SoftwareVersion;
+    use crate::engine::threshold::service::reshare_utils::ERR_FAILED_TO_FETCH_PUBLIC_MATERIALS;
     use crate::engine::threshold::service::reshare_utils::fetch_public_fhe_materials_from_peers;
     use crate::engine::threshold::service::reshare_utils::get_verified_fhe_public_materials;
-    use crate::engine::threshold::service::reshare_utils::ERR_FAILED_TO_FETCH_PUBLIC_MATERIALS;
     use crate::engine::utils::ERR_SERVER_KEY_DIGEST_MISMATCH;
     use crate::vault::storage::crypto_material::ThresholdCryptoMaterialStorage;
     use crate::vault::storage::ram::RamStorage;
@@ -715,21 +603,53 @@ mod tests {
     use crate::vault::storage::s3::DummyReadOnlyS3StorageGetter;
     use crate::vault::storage::store_versioned_at_request_id;
     use aes_prng::AesRng;
-    use kms_grpc::rpc_types::PubDataType;
     use kms_grpc::ContextId;
     use kms_grpc::RequestId;
+    use kms_grpc::rpc_types::PubDataType;
     use rand::SeedableRng;
-    use tfhe::shortint::ClassicPBSParameters;
     use tfhe::CompactPublicKey;
     use tfhe::ServerKey;
+    use tfhe::shortint::ClassicPBSParameters;
 
     #[test]
-    fn test_split_devnet_url() {
-        let (url, bucket) = super::split_url(
+    fn test_split_url() {
+        // Virtual-hosted style: bucket is a subdomain
+        let (protocol, domain, bucket) = super::split_url(
             &"https://zama-zws-dev-tkms-b6q87.s3.eu-west-1.amazonaws.com/".to_string(),
         )
         .unwrap();
-        assert_eq!(url.as_str(), "https://s3.eu-west-1.amazonaws.com");
+        assert_eq!(protocol.as_str(), "https://");
+        assert_eq!(domain.as_str(), "s3.eu-west-1.amazonaws.com");
+        assert_eq!(bucket.as_str(), "zama-zws-dev-tkms-b6q87");
+
+        // Path-style: bucket is in the URL path
+        let (protocol, domain, bucket) =
+            super::split_url(&"http://localhost:9000/kms".to_string()).unwrap();
+        assert_eq!(protocol.as_str(), "http://");
+        assert_eq!(domain.as_str(), "localhost:9000");
+        assert_eq!(bucket.as_str(), "kms");
+
+        // MinIO mock endpoint with path bucket
+        let (protocol, domain, bucket) =
+            super::split_url(&"http://dev-s3-mock:9000/kms".to_string()).unwrap();
+        assert_eq!(protocol.as_str(), "http://");
+        assert_eq!(domain.as_str(), "dev-s3-mock:9000");
+        assert_eq!(bucket.as_str(), "kms");
+
+        // file:// URL (used in isolated tests)
+        let (protocol, domain, bucket) =
+            super::split_url(&"file:///tmp/test-material".to_string()).unwrap();
+        assert_eq!(protocol.as_str(), "file://");
+        assert_eq!(domain.as_str(), "");
+        assert_eq!(bucket.as_str(), "/tmp/test-material");
+
+        // Path-style S3 with region
+        let (protocol, domain, bucket) = super::split_url(
+            &"https://s3.us-west-1.amazonaws.com/zama-zws-dev-tkms-b6q87/".to_string(),
+        )
+        .unwrap();
+        assert_eq!(protocol.as_str(), "https://");
+        assert_eq!(domain.as_str(), "s3.us-west-1.amazonaws.com");
         assert_eq!(bucket.as_str(), "zama-zws-dev-tkms-b6q87");
     }
 
@@ -885,9 +805,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert!(err
-                .to_string()
-                .contains(ERR_FAILED_TO_FETCH_PUBLIC_MATERIALS));
+            assert!(
+                err.to_string()
+                    .contains(ERR_FAILED_TO_FETCH_PUBLIC_MATERIALS)
+            );
         }
     }
 
@@ -1069,25 +990,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_find_region() {
-        let url = "https://zama-zws-dev-tkms-b6q87.s3.eu-west-1.amazonaws.com/".to_string();
-        let region = super::find_region_from_s3_url(&url).unwrap();
-        assert_eq!(region.as_str(), "eu-west-1");
-
-        let url = "https://s3.us-west-1.amazonaws.com/zama-zws-dev-tkms-b6q87/".to_string();
-        let region = super::find_region_from_s3_url(&url).unwrap();
-        assert_eq!(region.as_str(), "us-west-1");
-
-        let url = "https://s3.amazonaws.com/zama-zws-dev-tkms-b6q87/".to_string();
-        let region = super::find_region_from_s3_url(&url).unwrap();
-        assert_eq!(region.as_str(), "us-east-1");
-
-        let url = "http://dev-s3-mock:9000".to_string();
-        let region = super::find_region_from_s3_url(&url).unwrap();
-        assert_eq!(region.as_str(), "us-east-1");
-    }
-
     // ==================== Compressed Key Tests ====================
     use super::VerifiedPublicMaterial;
     use crate::engine::utils::ERR_COMPRESSED_KEYSET_DIGEST_MISMATCH;
@@ -1261,9 +1163,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains(ERR_COMPRESSED_KEYSET_DIGEST_MISMATCH));
+        assert!(
+            err.to_string()
+                .contains(ERR_COMPRESSED_KEYSET_DIGEST_MISMATCH)
+        );
     }
 
     #[tokio::test]

@@ -1,21 +1,21 @@
-use super::{Storage, StorageReader, StorageType};
+use super::{Storage, StorageReader, StorageType, StoreWriteOutcome};
 use crate::consts::KEY_PATH_PREFIX;
 use crate::util::file_handling::{
     safe_read_element_versioned, safe_write_element_versioned, write_bytes,
 };
-use crate::vault::storage::{all_data_ids_from_all_epochs_impl, StorageExt, StorageReaderExt};
+use crate::vault::storage::{StorageExt, StorageReaderExt, all_data_ids_from_all_epochs_impl};
 use crate::vault::storage_prefix_safety;
 use crate::{anyhow_error_and_log, some_or_err};
-use kms_grpc::identifiers::EpochId;
 use kms_grpc::RequestId;
-use serde::{de::DeserializeOwned, Serialize};
+use kms_grpc::identifiers::EpochId;
+use serde::{Serialize, de::DeserializeOwned};
 use std::{
     collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     str::FromStr,
 };
-use tfhe::{named::Named, Unversionize, Versionize};
+use tfhe::{Unversionize, Versionize, named::Named};
 
 #[derive(Default, Clone, Debug)]
 pub struct FileStorage {
@@ -57,33 +57,6 @@ impl FileStorage {
         Ok(Self {
             path: path.canonicalize()?,
         })
-    }
-
-    // Check if a path already exists and create it if not.
-    pub async fn setup_dirs(&self, url_path: &Path) -> anyhow::Result<()> {
-        if url_path.try_exists().is_ok_and(|res| res) {
-            // If the path exists, then trace a warning
-            tracing::warn!(
-                "The path {} already exists. Keeping the data without overwriting",
-                url_path
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("Could not convert path to string"))?
-            );
-            return Ok(());
-        }
-        // Create the directory
-        tokio::fs::create_dir_all(self.root_dir())
-            .await
-            .map_err(|e| {
-                tracing::warn!(
-                    "Could not create directory {}: {}",
-                    self.root_dir().display(),
-                    e
-                );
-                e
-            })?;
-
-        Ok(())
     }
 
     fn item_path(&self, data_id: &RequestId, data_type: &str) -> PathBuf {
@@ -184,7 +157,7 @@ impl StorageReader for FileStorage {
         let path = self.item_path(data_id, data_type);
         tokio::fs::read(&path).await.map_err(|e| {
             anyhow_error_and_log(format!(
-                "Could not read from path {}: {}",
+                "Could not load bytes from path {}: {}",
                 path.display(),
                 e
             ))
@@ -251,7 +224,9 @@ impl StorageReaderExt for FileStorage {
         &self,
         data_type: &str,
     ) -> anyhow::Result<HashSet<RequestId>> {
-        all_data_ids_from_all_epochs_impl(self, data_type).await
+        all_data_ids_from_all_epochs_impl(self, data_type)
+            .await
+            .map(|(ids, _)| ids)
     }
 
     async fn load_bytes_at_epoch(
@@ -263,7 +238,7 @@ impl StorageReaderExt for FileStorage {
         let path = self.item_path_at_epoch(data_id, epoch_id, data_type);
         tokio::fs::read(&path).await.map_err(|e| {
             anyhow_error_and_log(format!(
-                "Could not read from path {}: {}",
+                "Could not load bytes from path {}: {}",
                 path.display(),
                 e
             ))
@@ -278,15 +253,14 @@ impl Storage for FileStorage {
         data: &T,
         data_id: &RequestId,
         data_type: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<StoreWriteOutcome> {
         let path = self.item_path(data_id, data_type);
-        self.setup_dirs(&path).await?;
         if self.data_exists(data_id, data_type).await? {
             tracing::warn!(
                 "The path {} already exists. Keeping the data without overwriting",
                 path.display()
             );
-            return Ok(());
+            return Ok(StoreWriteOutcome::SkippedExisting);
         }
         safe_write_element_versioned(&path, data)
             .await
@@ -294,7 +268,7 @@ impl Storage for FileStorage {
                 tracing::warn!("Could not write to path {}: {}", path.display(), e);
                 e
             })?;
-        Ok(())
+        Ok(StoreWriteOutcome::Created)
     }
 
     /// Store bytes with a specific [url], giving a warning if the data already exists and exits _without_ writing
@@ -303,21 +277,20 @@ impl Storage for FileStorage {
         bytes: &[u8],
         data_id: &RequestId,
         data_type: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<StoreWriteOutcome> {
         let path = self.item_path(data_id, data_type);
-        self.setup_dirs(&path).await?;
         if self.data_exists(data_id, data_type).await? {
             tracing::warn!(
                 "The path {} already exists. Keeping the data without overwriting",
                 path.display()
             );
-            return Ok(());
+            return Ok(StoreWriteOutcome::SkippedExisting);
         }
         write_bytes(path.as_path(), bytes).await.map_err(|e| {
             tracing::warn!("Could not write to path {}: {}", path.display(), e);
             e
         })?;
-        Ok(())
+        Ok(StoreWriteOutcome::Created)
     }
 
     async fn delete_data(&mut self, data_id: &RequestId, data_type: &str) -> anyhow::Result<()> {
@@ -333,9 +306,8 @@ impl StorageExt for FileStorage {
         data_id: &RequestId,
         epoch_id: &EpochId,
         data_type: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<StoreWriteOutcome> {
         let path = self.item_path_at_epoch(data_id, epoch_id, data_type);
-        self.setup_dirs(&path).await?;
         if self
             .data_exists_at_epoch(data_id, epoch_id, data_type)
             .await?
@@ -344,7 +316,7 @@ impl StorageExt for FileStorage {
                 "The path {} already exists. Keeping the data without overwriting",
                 path.display()
             );
-            return Ok(());
+            return Ok(StoreWriteOutcome::SkippedExisting);
         }
         tracing::info!(
             "Storing data {} at epoch {:?} at path {}",
@@ -358,7 +330,7 @@ impl StorageExt for FileStorage {
                 tracing::warn!("Could not write to path {}: {}", path.display(), e);
                 e
             })?;
-        Ok(())
+        Ok(StoreWriteOutcome::Created)
     }
 
     async fn store_bytes_at_epoch(
@@ -367,9 +339,8 @@ impl StorageExt for FileStorage {
         data_id: &RequestId,
         epoch_id: &EpochId,
         data_type: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<StoreWriteOutcome> {
         let path = self.item_path_at_epoch(data_id, epoch_id, data_type);
-        self.setup_dirs(&path).await?;
         if self
             .data_exists_at_epoch(data_id, epoch_id, data_type)
             .await?
@@ -378,13 +349,13 @@ impl StorageExt for FileStorage {
                 "The path {} already exists. Keeping the data without overwriting",
                 path.display()
             );
-            return Ok(());
+            return Ok(StoreWriteOutcome::SkippedExisting);
         }
         write_bytes(path.as_path(), bytes).await.map_err(|e| {
             tracing::warn!("Could not write to path {}: {}", path.display(), e);
             e
         })?;
-        Ok(())
+        Ok(StoreWriteOutcome::Created)
     }
 
     async fn delete_data_at_epoch(
@@ -397,12 +368,11 @@ impl StorageExt for FileStorage {
         tokio::fs::remove_file(&path).await?;
 
         // Remove the epoch directory if it's now empty
-        if let Some(epoch_dir) = path.parent() {
-            if let Ok(mut entries) = tokio::fs::read_dir(epoch_dir).await {
-                if entries.next_entry().await?.is_none() {
-                    let _ = tokio::fs::remove_dir(epoch_dir).await;
-                }
-            }
+        if let Some(epoch_dir) = path.parent()
+            && let Ok(mut entries) = tokio::fs::read_dir(epoch_dir).await
+            && entries.next_entry().await?.is_none()
+        {
+            let _ = tokio::fs::remove_dir(epoch_dir).await;
         }
         Ok(())
     }
@@ -432,34 +402,44 @@ pub mod tests {
 
         // urls should be empty
         for data_type in PubDataType::iter() {
-            assert!(storage1
-                .all_data_ids(&data_type.to_string())
-                .await
-                .unwrap()
-                .is_empty());
-            assert!(storage2
-                .all_data_ids(&data_type.to_string())
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                storage1
+                    .all_data_ids(&data_type.to_string())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                storage2
+                    .all_data_ids(&data_type.to_string())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
 
         let data = TestType { i: 13 };
         let id = derive_request_id("ID").unwrap();
         let wrong_id = derive_request_id("WRONG_ID").unwrap();
         // make sure we can put it in storage1
-        assert!(storage1
-            .store_data(&data, &id, &PubDataType::CRS.to_string())
-            .await
-            .is_ok());
-        assert!(storage1
-            .data_exists(&id, &PubDataType::CRS.to_string())
-            .await
-            .unwrap());
-        assert!(!storage1
-            .data_exists(&wrong_id, &PubDataType::CRS.to_string())
-            .await
-            .unwrap());
+        assert!(
+            storage1
+                .store_data(&data, &id, &PubDataType::CRS.to_string())
+                .await
+                .is_ok()
+        );
+        assert!(
+            storage1
+                .data_exists(&id, &PubDataType::CRS.to_string())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage1
+                .data_exists(&wrong_id, &PubDataType::CRS.to_string())
+                .await
+                .unwrap()
+        );
     }
 
     #[ignore]
@@ -544,7 +524,6 @@ pub mod tests {
     }
 
     /// Test that files don't get silently overwritten
-    #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_overwrite_logic_files() {
         // Setup temporary directory and storage
@@ -553,9 +532,6 @@ pub mod tests {
         let mut storage = FileStorage::new(Some(path), StorageType::PUB, None).unwrap();
         test_store_bytes_does_not_overwrite_existing_bytes(&mut storage).await;
         test_store_data_does_not_overwrite_existing_data(&mut storage).await;
-        assert!(logs_contain(
-            "already exists. Keeping the data without overwriting"
-        ));
     }
 
     #[tokio::test]
@@ -582,16 +558,12 @@ pub mod tests {
         test_store_load_bytes_at_epoch(&mut storage).await;
     }
 
-    #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_store_bytes_at_epoch_does_not_overwrite_file() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path();
         let mut storage = FileStorage::new(Some(path), StorageType::PRIV, None).unwrap();
         test_store_bytes_at_epoch_does_not_overwrite(&mut storage).await;
-        assert!(logs_contain(
-            "already exists. Keeping the data without overwriting"
-        ));
     }
 
     #[tokio::test]

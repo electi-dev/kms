@@ -9,8 +9,6 @@ pub mod util {
     pub mod file_handling;
     pub mod key_setup;
     pub mod meta_store;
-    #[cfg(any(test, feature = "testing", feature = "insecure"))]
-    pub mod random_free_port;
     pub mod rate_limiter;
     pub mod retry;
 }
@@ -54,8 +52,7 @@ pub fn some_or_err<T>(input: Option<T>, error: String) -> anyhow::Result<T> {
 }
 
 // NOTE: the below is copied from core/threshold
-// since the calling tracing from another crate
-// does not generate correct logs in tracing_test::traced_test
+// since calling tracing from another crate may not generate correct logs
 #[track_caller]
 pub(crate) fn anyhow_error_and_log<S: AsRef<str> + fmt::Display>(msg: S) -> anyhow::Error {
     tracing::error!("Error in {}: {}", Location::caller(), msg);
@@ -86,4 +83,4 @@ pub(crate) fn dummy_domain() -> alloy_sol_types::Eip712Domain {
 }
 
 // re-export DecryptionMode
-pub use threshold_fhe::execution::endpoints::decryption::DecryptionMode;
+pub use threshold_execution::endpoints::decryption::DecryptionMode;

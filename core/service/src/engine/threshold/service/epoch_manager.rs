@@ -21,48 +21,44 @@
 //! In particular, this means that parties must be aware of both contexts (the old one and the new one) even if
 //! they are not part of one of the two contexts.
 
+use algebra::galois_rings::degree_4::{ResiduePolyF4Z64, ResiduePolyF4Z128};
 use alloy_dyn_abi::Eip712Domain;
 use futures_util::{
-    future::{join_all, BoxFuture},
     FutureExt, TryFutureExt,
+    future::{BoxFuture, join_all},
 };
 use itertools::Itertools;
 use kms_grpc::{
+    ContextId, EpochId,
     kms::v1::{
         CrsGenResult, DestroyMpcEpochRequest, Empty, EpochResultResponse, KeyDigest, KeyGenResult,
         NewMpcEpochRequest, PreviousEpochInfo, RequestId,
     },
     rpc_types::{PrivDataType, PubDataType},
     utils::tonic_result::BoxedStatus,
-    ContextId, EpochId,
 };
 use observability::metrics_names::{OP_DESTROY_EPOCH, OP_GET_EPOCH_RESULT, OP_NEW_EPOCH};
 use std::{collections::HashMap, future::Future, marker::PhantomData, sync::Arc};
 use tfhe::zk::CompactPkeCrs;
-use threshold_fhe::{
-    algebra::galois_rings::degree_4::{ResiduePolyF4Z128, ResiduePolyF4Z64},
-    execution::{
-        endpoints::reshare_sk::{ResharePreprocRequired, ReshareSecretKeys},
-        online::preprocessing::BasePreprocessing,
-        runtime::{
-            party::TwoSetsRole,
-            sessions::{
-                base_session::{BaseSession, TwoSetsBaseSession},
-                session_parameters::GenericParameterHandles,
-                small_session::SmallSession,
-            },
-        },
-        small_execution::{
-            offline::{Preprocessing, SecureSmallPreprocessing},
-            prss::{PRSSInit, PRSSSetup},
-        },
-        tfhe_internals::{
-            parameters::{DKGParams, DkgMode},
-            private_keysets::PrivateKeySet,
-        },
+use threshold_execution::{
+    endpoints::reshare_sk::{ResharePreprocRequired, ReshareSecretKeys},
+    online::preprocessing::BasePreprocessing,
+    runtime::sessions::{
+        base_session::{BaseSession, TwoSetsBaseSession},
+        session_parameters::GenericParameterHandles,
+        small_session::SmallSession,
     },
-    networking::NetworkMode,
+    small_execution::{
+        offline::{Preprocessing, SecureSmallPreprocessing},
+        prss::{PRSSInit, PRSSSetup},
+    },
+    tfhe_internals::{
+        parameters::{DKGParams, DkgMode},
+        private_keysets::PrivateKeySet,
+    },
 };
+use threshold_types::network::NetworkMode;
+use threshold_types::role::TwoSetsRole;
 use tokio::sync::RwLock;
 use tokio_util::task::TaskTracker;
 use tonic::{Request, Response};
@@ -71,34 +67,34 @@ use crate::{
     cryptography::signatures::PrivateSigKey,
     engine::{
         base::{
-            compute_info_compressed_keygen, compute_info_crs, compute_info_standard_keygen,
-            retrieve_parameters, CrsGenMetadata, KeyGenMetadata, DSEP_PUBDATA_CRS,
-            DSEP_PUBDATA_KEY,
+            CrsGenMetadata, DSEP_PUBDATA_CRS, DSEP_PUBDATA_KEY, KeyGenMetadata,
+            compute_info_compressed_keygen, compute_info_crs, compute_info_uncompressed_keygen,
+            retrieve_parameters,
         },
         threshold::service::{
+            PublicKeyMaterial, ThresholdFheKeys,
             reshare_utils::{
-                get_verified_crs_material, get_verified_fhe_public_materials,
-                VerifiedPublicMaterial,
+                VerifiedPublicMaterial, get_verified_crs_material,
+                get_verified_fhe_public_materials,
             },
             session::{ImmutableSessionMaker, PRSSSetupCombined, SessionMaker},
-            PublicKeyMaterial, ThresholdFheKeys,
         },
         traits::EpochManager,
         utils::MetricedError,
         validation::{
-            parse_grpc_request_id, parse_optional_grpc_request_id, validate_new_mpc_epoch_request,
             RequestIdParsingErr, ResharingParams, VerifiedNewMpcEpochRequest,
+            parse_grpc_request_id, parse_optional_grpc_request_id, validate_new_mpc_epoch_request,
         },
     },
     util::{
-        meta_store::{retrieve_from_meta_store, update_err_req_in_meta_store, MetaStore},
+        meta_store::{MetaStore, retrieve_from_meta_store, update_err_req_in_meta_store},
         rate_limiter::RateLimiter,
     },
     vault::storage::{
+        Storage, StorageExt,
         crypto_material::{PrivateCryptoMaterialReader, ThresholdCryptoMaterialStorage},
         delete_at_request_and_epoch_id, delete_at_request_id,
         s3::RealReadOnlyS3StorageGetter,
-        store_versioned_at_request_id, Storage, StorageExt,
     },
 };
 
@@ -128,14 +124,12 @@ struct VerifiedKeyInfo {
     /// The domain separator DSEP_PUBDATA_KEY="PDAT_KEY" is used when hashing the keys.
     /// If there are no key_digests, the digest verification is skipped.
     pub key_digests: HashMap<PubDataType, Vec<u8>>,
-    pub extra_data: Vec<u8>,
 }
 
 #[derive(Debug)]
 struct VerifiedCrsInfo {
     pub crs_id: kms_grpc::RequestId,
     pub crs_digest: Vec<u8>,
-    pub extra_data: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -169,6 +163,7 @@ fn verify_epoch_info(
     let epoch_id: EpochId =
         parse_optional_grpc_request_id(&previous_epoch.epoch_id, RequestIdParsingErr::Epoch)
             .map_err(make_metriced_err)?;
+
     let keys_info = previous_epoch
         .keys_info
         .into_iter()
@@ -211,9 +206,6 @@ fn verify_epoch_info(
                 preproc_id,
                 key_parameters,
                 key_digests,
-                // TODO: for RFC005 add this field to request and here
-                // this will come externally, i.e., via KeyInfo
-                extra_data: vec![],
             })
         })
         .try_collect()?;
@@ -231,7 +223,6 @@ fn verify_epoch_info(
             Ok(VerifiedCrsInfo {
                 crs_id,
                 crs_digest: crs_info.crs_digest,
-                extra_data: vec![], //TODO: for RFC005 add this field to request and here
             })
         })
         .try_collect()?;
@@ -269,18 +260,18 @@ pub struct RealThresholdEpochManager<
 }
 
 impl<
-        PubS: Storage + Send + Sync + 'static,
-        PrivS: StorageExt + Send + Sync + 'static,
-        Init: PRSSInit<ResiduePolyF4Z64, OutputType = PRSSSetup<ResiduePolyF4Z64>>
-            + PRSSInit<ResiduePolyF4Z128, OutputType = PRSSSetup<ResiduePolyF4Z128>>
-            + Default
-            + 'static,
-        Reshare: ReshareSecretKeys + Default + 'static,
-    > RealThresholdEpochManager<PubS, PrivS, Init, Reshare>
+    PubS: Storage + Send + Sync + 'static,
+    PrivS: StorageExt + Send + Sync + 'static,
+    Init: PRSSInit<ResiduePolyF4Z64, OutputType = PRSSSetup<ResiduePolyF4Z64>>
+        + PRSSInit<ResiduePolyF4Z128, OutputType = PRSSSetup<ResiduePolyF4Z128>>
+        + Default
+        + 'static,
+    Reshare: ReshareSecretKeys + Default + 'static,
+> RealThresholdEpochManager<PubS, PrivS, Init, Reshare>
 {
     /// This will load all PRSS setups from storage into session maker.
     pub async fn init_all_prss_from_storage(&self) -> anyhow::Result<()> {
-        let all_prss = self.crypto_storage.inner.read_all_prss_info().await?;
+        let all_prss = self.crypto_storage.read_all_prss_info().await?;
 
         for (epoch_id, prss) in all_prss {
             self.session_maker.add_epoch(epoch_id.into(), prss).await;
@@ -360,20 +351,13 @@ impl<
             threshold: base_session.parameters.threshold(),
         };
 
-        // serialize and write PRSS Setup to storage into private storage
-        let private_storage = Arc::clone(&crypto_storage.inner.private_storage);
-        let mut priv_storage = private_storage.lock().await;
-
-        // Ensure data can be stored before updating the model in ram
-        store_versioned_at_request_id(
-            &mut (*priv_storage),
-            &(*epoch_id).into(),
-            &prss,
-            &PrivDataType::PrssSetupCombined.to_string(),
-        )
-        .await?;
-
+        crypto_storage.write_prss_info(epoch_id, &prss).await?;
         session_maker.add_epoch(*epoch_id, prss).await;
+        // Update the backup and handle potential failures by incrementing backup errors in the metrics
+        crypto_storage
+            .inner
+            .update_backup_vault(false, OP_NEW_EPOCH)
+            .await;
 
         tracing::info!(
             "PRSS on epoch ID {} completed successfully for identity {}.",
@@ -482,7 +466,10 @@ impl<
         mut two_sets_session: TwoSetsBaseSession,
         new_epoch_id: EpochId,
         verified_previous_epoch: VerifiedPreviousEpochInfo,
-    ) -> Result<impl Future<Output = anyhow::Result<()>>, MetricedError> {
+    ) -> Result<
+        impl Future<Output = anyhow::Result<()>> + use<PubS, PrivS, Init, Reshare>,
+        MetricedError,
+    > {
         let epoch_id_as_request_id = new_epoch_id.into();
 
         let keys = self
@@ -614,6 +601,7 @@ impl<
         meta_store: Arc<RwLock<MetaStore<EpochOutput>>>,
         sk: &PrivateSigKey,
         new_epoch_id: EpochId,
+        new_extra_data: Vec<u8>,
         verified_previous_epoch: &VerifiedPreviousEpochInfo,
         verified_materials: Vec<VerifiedPublicMaterial>,
         new_private_keysets: Vec<PrivateKeySet<4>>,
@@ -635,14 +623,14 @@ impl<
             // TODO(2905): https://github.com/zama-ai/kms-internal/issues/2905
             match verified_material {
                 VerifiedPublicMaterial::Uncompressed(fhe_pubkeys) => {
-                    let info = match compute_info_standard_keygen(
+                    let info = match compute_info_uncompressed_keygen(
                         sk,
                         &DSEP_PUBDATA_KEY,
                         &key_info.preproc_id,
                         &key_info.key_id,
                         &fhe_pubkeys,
                         eip712_domain,
-                        key_info.extra_data.clone(),
+                        new_extra_data.clone(),
                     ) {
                         Ok(info) => info,
                         Err(e) => {
@@ -650,18 +638,18 @@ impl<
                         }
                     };
 
-                    let (integer_server_key, _, _, decompression_key, sns_key, _, _, _) =
+                    let (integer_server_key, _, _, decompression_key, sns_key, _, _, _, _) =
                         fhe_pubkeys.server_key.clone().into_raw_parts();
 
-                    let threshold_fhe_keys = ThresholdFheKeys {
-                        private_keys: Arc::new(new_private_keyset),
-                        public_material: PublicKeyMaterial::Uncompressed {
-                            integer_server_key: Arc::new(integer_server_key),
-                            sns_key: sns_key.map(Arc::new),
-                            decompression_key: decompression_key.map(Arc::new),
-                        },
-                        meta_data: info.clone(),
-                    };
+                    let threshold_fhe_keys = ThresholdFheKeys::new(
+                        Arc::new(new_private_keyset),
+                        PublicKeyMaterial::new_uncompressed(
+                            Arc::new(integer_server_key),
+                            sns_key.map(Arc::new),
+                            decompression_key.map(Arc::new),
+                        ),
+                        info.clone(),
+                    );
 
                     storage_tasks.push(
                         crypto_storage
@@ -677,14 +665,29 @@ impl<
                     fhe_key_infos.push(info);
                 }
                 VerifiedPublicMaterial::Compressed(compressed_keyset) => {
+                    // TODO(2905): https://github.com/zama-ai/kms-internal/issues/2905
+                    // Resharing currently signs and stores the CompactPublicKey derived
+                    // from the newly generated compressed keyset. Revisit whether it should
+                    // instead preserve the old keyset's CompactPublicKey to keep the
+                    // externally visible public key stable across epochs of the same key_id.
+                    let compact_public_key = compressed_keyset
+                        .clone()
+                        .decompress()
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to decompress reshared compressed keyset: {e}")
+                        })?
+                        .into_raw_parts()
+                        .0;
+
                     let info = match compute_info_compressed_keygen(
                         sk,
                         &DSEP_PUBDATA_KEY,
                         &key_info.preproc_id,
                         &key_info.key_id,
                         &compressed_keyset,
+                        &compact_public_key,
                         eip712_domain,
-                        key_info.extra_data.clone(),
+                        new_extra_data.clone(),
                     ) {
                         Ok(info) => info,
                         Err(e) => {
@@ -695,31 +698,33 @@ impl<
                         }
                     };
 
-                    let public_material =
-                        PublicKeyMaterial::new_compressed(compressed_keyset.clone())?;
+                    let public_material = PublicKeyMaterial::new(compressed_keyset.clone());
 
-                    let threshold_fhe_keys = ThresholdFheKeys {
-                        private_keys: Arc::new(new_private_keyset),
+                    let threshold_fhe_keys = ThresholdFheKeys::new(
+                        Arc::new(new_private_keyset),
                         public_material,
-                        meta_data: info.clone(),
-                    };
+                        info.clone(),
+                    );
 
                     let meta_store = Arc::clone(&meta_store);
                     storage_tasks.push(
                         async move {
                             let compressed_keyset = compressed_keyset;
+                            let compact_public_key = compact_public_key;
                             crypto_storage
                                 .inner_write_threshold_keys_compressed(
                                     &key_info.key_id,
                                     &new_epoch_id,
                                     threshold_fhe_keys,
                                     &compressed_keyset,
+                                    &compact_public_key,
                                     meta_store,
                                 )
                                 .await
                         }
                         .boxed(),
                     );
+
                     fhe_key_infos.push(info);
                 }
             }
@@ -736,12 +741,12 @@ impl<
                 &crs_info.crs_id,
                 &crs,
                 eip712_domain,
-                crs_info.extra_data.clone(),
+                new_extra_data.clone(),
             )?;
             crs_metadatas.push(crs_meta_data.clone());
             storage_tasks.push(
                 crypto_storage
-                    .inner_write_crs(
+                    .resharing_crs_write(
                         &crs_info.crs_id,
                         &new_epoch_id,
                         crs,
@@ -757,18 +762,29 @@ impl<
         meta_store.write().await.update(
             &new_epoch_id.into(),
             Ok(EpochOutput::Reshare((fhe_key_infos, crs_metadatas))),
-        )
+        )?;
+        // Update the backup and handle potential failures by incrementing backup errors in the metrics
+        crypto_storage
+            .inner
+            .update_backup_vault(false, OP_NEW_EPOCH)
+            .await;
+        Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn reshare_as_set_2(
         &self,
         two_sets_session: TwoSetsBaseSession,
         new_epoch_id: EpochId,
         new_context_id: ContextId,
+        new_extra_data: Vec<u8>,
         verified_previous_epoch: VerifiedPreviousEpochInfo,
         eip712_domain: Eip712Domain,
         crs_info: Vec<CompactPkeCrs>,
-    ) -> Result<impl Future<Output = anyhow::Result<()>>, MetricedError> {
+    ) -> Result<
+        impl Future<Output = anyhow::Result<()>> + use<PubS, PrivS, Init, Reshare>,
+        MetricedError,
+    > {
         let epoch_id_as_request_id = new_epoch_id.into();
 
         let verified_fhe_public_materials = join_all(verified_previous_epoch.keys_info.iter().map(
@@ -843,6 +859,7 @@ impl<
                 meta_store,
                 &sk,
                 new_epoch_id,
+                new_extra_data,
                 &verified_previous_epoch,
                 verified_fhe_public_materials,
                 new_private_keysets,
@@ -855,15 +872,20 @@ impl<
         Ok(task)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn reshare_as_both_sets(
         &self,
         two_sets_session: TwoSetsBaseSession,
         new_epoch_id: EpochId,
         new_context_id: ContextId,
+        new_extra_data: Vec<u8>,
         verified_previous_epoch: VerifiedPreviousEpochInfo,
         eip712_domain: Eip712Domain,
         crs_info: Vec<CompactPkeCrs>,
-    ) -> Result<impl Future<Output = anyhow::Result<()>>, MetricedError> {
+    ) -> Result<
+        impl Future<Output = anyhow::Result<()>> + use<PubS, PrivS, Init, Reshare>,
+        MetricedError,
+    > {
         let epoch_id_as_request_id = new_epoch_id.into();
 
         let verified_fhe_public_materials = join_all(verified_previous_epoch.keys_info.iter().map(
@@ -967,6 +989,7 @@ impl<
                 meta_store,
                 &sk,
                 new_epoch_id,
+                new_extra_data,
                 &verified_previous_epoch,
                 verified_fhe_public_materials,
                 new_private_keysets,
@@ -1076,6 +1099,7 @@ impl<
         &self,
         new_context_id: &ContextId,
         new_epoch_id: &EpochId,
+        new_extra_data: &[u8],
         previous_epoch: PreviousEpochInfo,
         eip712_domain: Eip712Domain,
     ) -> Result<BoxFuture<'static, anyhow::Result<()>>, MetricedError> {
@@ -1083,7 +1107,11 @@ impl<
             "Received initiate resharing request from context {:?} to context {:?} for Key IDs {:?} for epoch ID {:?}",
             previous_epoch.context_id,
             new_context_id,
-            previous_epoch.keys_info.iter().map(|k| &k.key_id).collect::<Vec<_>>(),
+            previous_epoch
+                .keys_info
+                .iter()
+                .map(|k| &k.key_id)
+                .collect::<Vec<_>>(),
             new_epoch_id
         );
 
@@ -1138,6 +1166,7 @@ impl<
                     two_sets_session,
                     *new_epoch_id,
                     *new_context_id,
+                    new_extra_data.to_vec(),
                     verified_previous_epoch,
                     eip712_domain,
                     crs_info,
@@ -1149,6 +1178,7 @@ impl<
                     two_sets_session,
                     *new_epoch_id,
                     *new_context_id,
+                    new_extra_data.to_vec(),
                     verified_previous_epoch,
                     eip712_domain,
                     crs_info,
@@ -1161,14 +1191,14 @@ impl<
 
 #[tonic::async_trait]
 impl<
-        PubS: Storage + Send + Sync + 'static,
-        PrivS: StorageExt + Send + Sync + 'static,
-        Init: PRSSInit<ResiduePolyF4Z64, OutputType = PRSSSetup<ResiduePolyF4Z64>>
-            + PRSSInit<ResiduePolyF4Z128, OutputType = PRSSSetup<ResiduePolyF4Z128>>
-            + Default
-            + 'static,
-        Reshare: ReshareSecretKeys + Default + 'static,
-    > EpochManager for RealThresholdEpochManager<PubS, PrivS, Init, Reshare>
+    PubS: Storage + Send + Sync + 'static,
+    PrivS: StorageExt + Send + Sync + 'static,
+    Init: PRSSInit<ResiduePolyF4Z64, OutputType = PRSSSetup<ResiduePolyF4Z64>>
+        + PRSSInit<ResiduePolyF4Z128, OutputType = PRSSSetup<ResiduePolyF4Z128>>
+        + Default
+        + 'static,
+    Reshare: ReshareSecretKeys + Default + 'static,
+> EpochManager for RealThresholdEpochManager<PubS, PrivS, Init, Reshare>
 {
     async fn new_mpc_epoch(
         &self,
@@ -1180,6 +1210,7 @@ impl<
         let VerifiedNewMpcEpochRequest {
             context_id,
             epoch_id,
+            extra_data,
             resharing: resharing_params,
         } = validate_new_mpc_epoch_request(inner)?;
 
@@ -1200,6 +1231,7 @@ impl<
                 self.initiate_resharing_and_crs_resign(
                     &context_id,
                     &epoch_id,
+                    &extra_data,
                     previous_epoch,
                     signing_domain,
                 )
@@ -1248,20 +1280,19 @@ impl<
             let context_id = context_id;
             let epoch_id = epoch_id;
             let meta_store = meta_store;
-            if do_prss {
-                if let Err(e) =
+            if do_prss
+                && let Err(e) =
                     Self::internal_init_prss(session_maker, &crypto_storage, &context_id, &epoch_id)
                         .await
-                {
-                    let err = format!("PRSS initialization failed during epoch creation: {e:?}");
-                    let _ = update_err_req_in_meta_store(
-                        &mut meta_store.write().await,
-                        &epoch_id.into(),
-                        err,
-                        OP_NEW_EPOCH,
-                    );
-                    return;
-                }
+            {
+                let err = format!("PRSS initialization failed during epoch creation: {e:?}");
+                let _ = update_err_req_in_meta_store(
+                    &mut meta_store.write().await,
+                    &epoch_id.into(),
+                    err,
+                    OP_NEW_EPOCH,
+                );
+                return;
             }
             if let Some(resharing_task) = resharing_task {
                 if let Err(e) = resharing_task.await {
@@ -1370,9 +1401,9 @@ impl<
                                 OP_GET_EPOCH_RESULT,
                                 Some(request_id),
                                 anyhow::anyhow!(
-                            "Resharing should not return legacy metadata for request ID {:?}",
-                            request_id
-                        ),
+                                    "Resharing should not return legacy metadata for request ID {:?}",
+                                    request_id
+                                ),
                                 tonic::Code::InvalidArgument,
                             ));
                         }
@@ -1423,34 +1454,40 @@ pub(crate) mod tests {
     use crate::{
         client::test_tools::{self},
         consts::{
-            DEFAULT_EPOCH_ID, PRIVATE_STORAGE_PREFIX_THRESHOLD_ALL,
-            PUBLIC_STORAGE_PREFIX_THRESHOLD_ALL,
+            DEFAULT_EPOCH_ID, DEFAULT_MPC_CONTEXT, PRIVATE_STORAGE_PREFIX_THRESHOLD_ALL,
+            PUBLIC_STORAGE_PREFIX_THRESHOLD_ALL, default_extra_data,
         },
         cryptography::signatures::gen_sig_keys,
-        engine::base::{derive_request_id, BaseKmsStruct},
+        engine::{
+            base::{BaseKmsStruct, derive_request_id},
+            threshold::service::session::PRSSSetupCombined,
+            utils::make_extra_data,
+        },
         util::rate_limiter::RateLimiterConfig,
         vault::storage::{
+            StorageType,
             file::FileStorage,
             ram::{self, RamStorage},
-            StorageType,
+            read_all_data_versioned, store_versioned_at_request_id,
         },
     };
     use aes_prng::AesRng;
     use kms_grpc::{
+        RequestId,
         kms::v1::{CrsInfo, FheParameter, KeyInfo, NewMpcEpochRequest},
-        rpc_types::KMSType,
+        rpc_types::{KMSType, PrivDataType},
     };
     use rand::SeedableRng;
-    use threshold_fhe::{
-        execution::endpoints::reshare_sk::SecureReshareSecretKeys,
+    use threshold_execution::{
+        endpoints::reshare_sk::SecureReshareSecretKeys,
         malicious_execution::small_execution::malicious_prss::EmptyPrss,
     };
 
     impl<
-            Init: PRSSInit<ResiduePolyF4Z64, OutputType = PRSSSetup<ResiduePolyF4Z64>>
-                + PRSSInit<ResiduePolyF4Z128, OutputType = PRSSSetup<ResiduePolyF4Z128>>,
-            Reshare: ReshareSecretKeys,
-        > RealThresholdEpochManager<ram::RamStorage, ram::RamStorage, Init, Reshare>
+        Init: PRSSInit<ResiduePolyF4Z64, OutputType = PRSSSetup<ResiduePolyF4Z64>>
+            + PRSSInit<ResiduePolyF4Z128, OutputType = PRSSSetup<ResiduePolyF4Z128>>,
+        Reshare: ReshareSecretKeys,
+    > RealThresholdEpochManager<ram::RamStorage, ram::RamStorage, Init, Reshare>
     {
         fn init_test(base_kms: BaseKmsStruct, session_maker: SessionMaker) -> Self {
             Self {
@@ -1481,7 +1518,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    #[tracing_test::traced_test]
     async fn prss_from_storage_test() {
         // We're starting two sets of servers in this test, both sets of servers will load all the keys
         // but it seems that the when shutting down the first set of servers, the keys are not immediately removed from memory
@@ -1560,17 +1596,27 @@ pub(crate) mod tests {
             server_handle.assert_shutdown().await;
         }
 
-        // check that PRSS setups were created
-        assert!(logs_contain(
-            "Initializing threshold KMS server and generating a new PRSS Setup for"
-        ));
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        // Structural check: PRSS must be on disk after the first run (persisted by PrssSetup).
+        let prss_after_first: std::collections::HashMap<RequestId, PRSSSetupCombined> =
+            read_all_data_versioned(
+                &priv_storage[0],
+                &PrivDataType::PrssSetupCombined.to_string(),
+            )
+            .await
+            .unwrap();
+        let default_epoch_as_req: RequestId = (*DEFAULT_EPOCH_ID).into();
+        assert!(
+            prss_after_first.contains_key(&default_epoch_as_req),
+            "expected PRSS for default epoch in party-0 private storage after first run"
+        );
 
         // create parties again without running PrssSetup this time (it should now be read from storage)
         let server_handles = test_tools::setup_threshold_no_client(
             PRSS_THRESHOLD as u8,
-            pub_storage,
-            priv_storage,
+            pub_storage.clone(),
+            priv_storage.clone(),
             vaults2,
             false,
             None,
@@ -1579,8 +1625,22 @@ pub(crate) mod tests {
         .await;
         assert_eq!(server_handles.len(), PRSS_AMOUNT_PARTIES);
 
-        // check that PRSS setups were not created, but instead read from storage now
-        assert!(logs_contain("Loaded PRSS Setup from storage"));
+        for server_handle in server_handles.into_values() {
+            server_handle.assert_shutdown().await;
+        }
+
+        // Second startup must not regenerate PRSS on disk (load-from-storage path only).
+        let prss_after_second: std::collections::HashMap<RequestId, PRSSSetupCombined> =
+            read_all_data_versioned(
+                &priv_storage[0],
+                &PrivDataType::PrssSetupCombined.to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prss_after_first, prss_after_second,
+            "PRSS in storage must be unchanged after second server run (no silent regeneration)"
+        );
     }
 
     #[tokio::test]
@@ -1652,9 +1712,11 @@ pub(crate) mod tests {
         epoch_manager
             .new_mpc_epoch(tonic::Request::new(NewMpcEpochRequest {
                 epoch_id: Some(epoch_id.into()),
-                context_id: None,
+                context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
                 previous_epoch: None,
                 domain: None,
+                extra_data: make_extra_data(2, Some(&DEFAULT_MPC_CONTEXT), Some(&epoch_id))
+                    .unwrap(),
             }))
             .await
             .unwrap();
@@ -1678,9 +1740,11 @@ pub(crate) mod tests {
             epoch_manager
                 .new_mpc_epoch(tonic::Request::new(NewMpcEpochRequest {
                     epoch_id: Some(epoch_id.into()),
-                    context_id: None,
+                    context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
                     previous_epoch: None,
                     domain: None,
+                    extra_data: make_extra_data(2, Some(&DEFAULT_MPC_CONTEXT), Some(&epoch_id))
+                        .unwrap(),
                 }))
                 .await
                 .unwrap_err()
@@ -1702,10 +1766,11 @@ pub(crate) mod tests {
             assert_eq!(
                 epoch_manager
                     .new_mpc_epoch(tonic::Request::new(NewMpcEpochRequest {
-                        epoch_id: Some(bad_epoch_id),
-                        context_id: None,
+                        epoch_id: Some(bad_epoch_id.clone()),
+                        context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
                         previous_epoch: None,
                         domain: None,
+                        extra_data: vec![], // Not important for this test
                     }))
                     .await
                     .unwrap_err()
@@ -1714,13 +1779,15 @@ pub(crate) mod tests {
             );
         }
         {
+            //
             assert_eq!(
                 epoch_manager
                     .new_mpc_epoch(tonic::Request::new(NewMpcEpochRequest {
                         epoch_id: None,
-                        context_id: None,
+                        context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
                         previous_epoch: None,
                         domain: None,
+                        extra_data: default_extra_data(),
                     }))
                     .await
                     .unwrap_err()
@@ -1743,6 +1810,7 @@ pub(crate) mod tests {
                 context_id: Some(context_id.into()),
                 previous_epoch: None,
                 domain: None,
+                extra_data: make_extra_data(2, Some(&context_id), Some(&epoch_id)).unwrap(),
             }))
             .await
             .unwrap_err();
@@ -1759,9 +1827,11 @@ pub(crate) mod tests {
         epoch_manager
             .new_mpc_epoch(tonic::Request::new(NewMpcEpochRequest {
                 epoch_id: Some(epoch_id.into()),
-                context_id: None,
+                context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
                 previous_epoch: None,
                 domain: None,
+                extra_data: make_extra_data(2, Some(&DEFAULT_MPC_CONTEXT), Some(&(epoch_id)))
+                    .unwrap(),
             }))
             .await
             .unwrap();
@@ -1774,6 +1844,7 @@ pub(crate) mod tests {
                     context_id: None,
                     previous_epoch: None,
                     domain: None,
+                    extra_data: Vec::new(),
                 }))
                 .await
                 .unwrap_err()
@@ -1992,7 +2063,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_destroy_epoch_success() {
         use crate::vault::storage::{
-            store_versioned_at_request_and_epoch_id, tests::TestType, StorageReaderExt,
+            StorageReaderExt, store_versioned_at_request_and_epoch_id, tests::TestType,
         };
 
         let mut rng = AesRng::seed_from_u64(42);

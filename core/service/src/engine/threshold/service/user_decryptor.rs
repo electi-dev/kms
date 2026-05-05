@@ -6,43 +6,41 @@ use std::{
 };
 
 // === External Crates ===
+use algebra::{
+    base_ring::Z128,
+    galois_rings::{
+        common::{ResiduePoly, pack_residue_poly},
+        degree_4::ResiduePolyF4Z128,
+    },
+    structure_traits::{ErrorCorrect, Invert, Ring, Solve},
+};
 use alloy_primitives::U256;
 use anyhow::anyhow;
 use kms_grpc::{
+    RequestId,
     identifiers::{ContextId, EpochId},
     kms::v1::{
         self, Empty, TypedCiphertext, TypedSigncryptedCiphertext, UserDecryptionRequest,
         UserDecryptionResponse, UserDecryptionResponsePayload,
     },
-    RequestId,
 };
 use observability::{
     metrics,
     metrics_names::{
-        OP_USER_DECRYPT_INNER, OP_USER_DECRYPT_REQUEST, OP_USER_DECRYPT_RESULT, TAG_CONTEXT_ID,
-        TAG_EPOCH_ID, TAG_KEY_ID, TAG_PARTY_ID, TAG_TFHE_TYPE, TAG_USER_DECRYPTION_KIND,
+        OP_USER_DECRYPT_INNER, OP_USER_DECRYPT_REQUEST, OP_USER_DECRYPT_RESULT, TAG_PARTY_ID,
+        TAG_TFHE_TYPE, TAG_USER_DECRYPTION_KIND,
     },
 };
 use rand::{CryptoRng, RngCore};
-use threshold_fhe::{
-    algebra::{
-        base_ring::Z128,
-        galois_rings::{
-            common::{pack_residue_poly, ResiduePoly},
-            degree_4::ResiduePolyF4Z128,
-        },
-        structure_traits::{ErrorCorrect, Invert, Ring, Solve},
+use thread_handles::spawn_compute_bound;
+use threshold_execution::{
+    endpoints::decryption::{
+        DecryptionMode, LowLevelCiphertext, OfflineNoiseFloodSession,
+        SmallOfflineNoiseFloodSession, partial_decrypt_using_noiseflooding,
+        secure_partial_decrypt_using_bitdec,
     },
-    execution::{
-        endpoints::decryption::{
-            partial_decrypt_using_noiseflooding, secure_partial_decrypt_using_bitdec,
-            DecryptionMode, LowLevelCiphertext, OfflineNoiseFloodSession,
-            SmallOfflineNoiseFloodSession,
-        },
-        runtime::sessions::small_session::SmallSession,
-        tfhe_internals::private_keysets::PrivateKeySet,
-    },
-    thread_handles::spawn_compute_bound,
+    runtime::sessions::small_session::SmallSession,
+    tfhe_internals::private_keysets::PrivateKeySet,
 };
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tokio_util::task::TaskTracker;
@@ -54,30 +52,31 @@ use crate::{
     anyhow_error_and_log,
     cryptography::{
         compute_external_user_decrypt_signature,
+        encryption::UnifiedPublicEncKey,
         error::CryptographyError,
         internal_crypto_types::LegacySerialization,
         signcryption::{SigncryptFHEPlaintext, UnifiedSigncryptionKeyOwned},
     },
     engine::{
-        base::{deserialize_to_low_level, BaseKmsStruct, UserDecryptCallValues},
+        base::{BaseKmsStruct, UserDecryptCallValues, deserialize_to_low_level},
         threshold::{
-            service::session::{validate_context_and_epoch, ImmutableSessionMaker},
+            service::session::{ImmutableSessionMaker, validate_context_and_epoch},
             traits::UserDecryptor,
         },
         traits::BaseKms,
         utils::MetricedError,
         validation::{
-            parse_grpc_request_id, validate_user_decrypt_req, RequestIdParsingErr,
-            DSEP_USER_DECRYPTION,
+            DSEP_USER_DECRYPTION, RequestIdParsingErr, parse_grpc_request_id,
+            validate_user_decrypt_req,
         },
     },
     util::{
         meta_store::{
-            add_req_to_meta_store, retrieve_from_meta_store, update_req_in_meta_store, MetaStore,
+            MetaStore, add_req_to_meta_store, retrieve_from_meta_store, update_req_in_meta_store,
         },
         rate_limiter::RateLimiter,
     },
-    vault::storage::{crypto_material::ThresholdCryptoMaterialStorage, Storage, StorageExt},
+    vault::storage::{Storage, StorageExt, crypto_material::ThresholdCryptoMaterialStorage},
 };
 
 // === Current Module Imports ===
@@ -156,21 +155,27 @@ pub struct RealUserDecryptor<
 }
 
 impl<
-        PubS: Storage + Send + Sync + 'static,
-        PrivS: StorageExt + Send + Sync + 'static,
-        Dec: NoiseFloodPartialDecryptor<
-                Prep = SmallOfflineNoiseFloodSession<
-                    { ResiduePolyF4Z128::EXTENSION_DEGREE },
-                    SmallSession<ResiduePolyF4Z128>,
-                >,
-            > + 'static,
-    > RealUserDecryptor<PubS, PrivS, Dec>
+    PubS: Storage + Send + Sync + 'static,
+    PrivS: StorageExt + Send + Sync + 'static,
+    Dec: NoiseFloodPartialDecryptor<
+            Prep = SmallOfflineNoiseFloodSession<
+                { ResiduePolyF4Z128::EXTENSION_DEGREE },
+                SmallSession<ResiduePolyF4Z128>,
+            >,
+        > + 'static,
+> RealUserDecryptor<PubS, PrivS, Dec>
 {
     /// Helper method for user decryption which carries out the actual threshold decryption using noise
     /// flooding or bit-decomposition.
     ///
     /// This function does not perform user decryption in a background thread.
     /// The return type should be [UserDecryptCallValues] except the final item in the tuple
+    ///
+    /// Note that the argument `client_enc_key_bytes` must be the original
+    /// bytes that was provided by the user, it should not go through any re-serialization.
+    /// The same information is in `signcryption_key.receiver_enc_key` but in there it is
+    /// already serialized, that's why the original bytes representation is still needed
+    /// for signing later on.
     #[allow(clippy::too_many_arguments)]
     async fn inner_user_decrypt(
         req_id: &RequestId,
@@ -181,6 +186,7 @@ impl<
         typed_ciphertexts: Vec<TypedCiphertext>,
         link: Vec<u8>,
         signcryption_key: Arc<UnifiedSigncryptionKeyOwned>,
+        client_enc_key_bytes_orig: Vec<u8>,
         fhe_keys: OwnedRwLockReadGuard<
             HashMap<(RequestId, EpochId), ThresholdFheKeys>,
             ThresholdFheKeys,
@@ -223,7 +229,7 @@ impl<
                 hex::encode(&typed_ciphertext.external_handle)
             );
 
-            let decomp_key = keys.get_decompression_key();
+            let decomp_key = keys.decompression_key();
             let low_level_ct = spawn_compute_bound(move || {
                 deserialize_to_low_level(fhe_type, ct_format, &ct, decomp_key.as_deref())
             })
@@ -243,9 +249,8 @@ impl<
 
                     let pdec = Dec::partial_decrypt(
                         &mut noiseflood_session,
-                        keys.get_integer_server_key(),
-                        keys.get_sns_key()
-                            .ok_or(anyhow::anyhow!("Missing sns key"))?,
+                        keys.integer_server_key(),
+                        keys.sns_key().ok_or(anyhow::anyhow!("Missing sns key"))?,
                         low_level_ct,
                         &keys.private_keys,
                     )
@@ -262,14 +267,14 @@ impl<
                                 None => {
                                     return Err(anyhow!(
                                         "User decryption with session ID {session_id} could not be retrieved for {dec_mode}"
-                                    ))
+                                    ));
                                 }
                             };
 
                             (pdec_serialized, packing_factor, time)
                         }
                         Err(e) => {
-                            return Err(anyhow!("Failed user decryption with noiseflooding: {e}"))
+                            return Err(anyhow!("Failed user decryption with noiseflooding: {e}"));
                         }
                     };
                     Ok(res)
@@ -288,7 +293,7 @@ impl<
                         &mut session,
                         &low_level_ct.try_get_small_ct()?,
                         &keys.private_keys,
-                        &keys.get_key_switching_key()?,
+                        &keys.key_switching_key()?,
                     )
                     .await;
 
@@ -303,7 +308,7 @@ impl<
                                 None => {
                                     return Err(anyhow!(
                                         "User decryption with session ID {session_id} could not be retrieved for {dec_mode}"
-                                    ))
+                                    ));
                                 }
                             };
 
@@ -386,7 +391,7 @@ impl<
             &signcryption_key.signing_key,
             &payload,
             domain,
-            &signcryption_key.receiver_enc_key,
+            &client_enc_key_bytes_orig,
             &extra_data,
         )?;
         Ok((payload, external_signature, extra_data))
@@ -429,15 +434,15 @@ impl<
 
 #[tonic::async_trait]
 impl<
-        PubS: Storage + Send + Sync + 'static,
-        PrivS: StorageExt + Send + Sync + 'static,
-        Dec: NoiseFloodPartialDecryptor<
-                Prep = SmallOfflineNoiseFloodSession<
-                    { ResiduePolyF4Z128::EXTENSION_DEGREE },
-                    SmallSession<ResiduePolyF4Z128>,
-                >,
-            > + 'static,
-    > UserDecryptor for RealUserDecryptor<PubS, PrivS, Dec>
+    PubS: Storage + Send + Sync + 'static,
+    PrivS: StorageExt + Send + Sync + 'static,
+    Dec: NoiseFloodPartialDecryptor<
+            Prep = SmallOfflineNoiseFloodSession<
+                { ResiduePolyF4Z128::EXTENSION_DEGREE },
+                SmallSession<ResiduePolyF4Z128>,
+            >,
+        > + 'static,
+> UserDecryptor for RealUserDecryptor<PubS, PrivS, Dec>
 {
     async fn user_decrypt(
         &self,
@@ -458,7 +463,7 @@ impl<
         let (
             typed_ciphertexts,
             link,
-            client_enc_key,
+            client_enc_key_bytes_orig, // the original bytes for the encryption key
             client_address,
             req_id,
             key_id,
@@ -478,9 +483,6 @@ impl<
         let dec_mode = self.decryption_mode;
         let metric_tags = vec![
             (TAG_PARTY_ID, my_role.to_string()),
-            (TAG_KEY_ID, key_id.as_str()), // TODO will this be too many labels or does it make sense to keep key, context and epoch
-            (TAG_CONTEXT_ID, context_id.as_str()),
-            (TAG_EPOCH_ID, epoch_id.as_str()),
             (TAG_USER_DECRYPTION_KIND, dec_mode.as_str_name().to_string()),
         ];
         timer.tags(metric_tags.clone());
@@ -508,6 +510,17 @@ impl<
             )
         })?)
         .clone();
+        let client_enc_key = UnifiedPublicEncKey::deserialize_and_validate(
+            &client_enc_key_bytes_orig,
+        )
+        .map_err(|e| {
+            MetricedError::new(
+                OP_USER_DECRYPT_REQUEST,
+                Some(req_id),
+                anyhow::anyhow!("Error deserializing UnifiedPublicEncKey: {e}"),
+                tonic::Code::Internal,
+            )
+        })?;
         let signcryption_key = Arc::new(UnifiedSigncryptionKeyOwned::new(
             sk,
             client_enc_key,
@@ -545,6 +558,7 @@ impl<
                 typed_ciphertexts,
                 link,
                 signcryption_key,
+                client_enc_key_bytes_orig,
                 fhe_keys_rlock,
                 dec_mode,
                 &domain,
@@ -624,7 +638,14 @@ impl<
 fn format_user_request(request: &UserDecryptionRequest) -> String {
     format!(
         "UserDecryptionRequest {{ request_id: {:?}, key_id: {:?}, context_id: {:?}, epoch_id: {:?}, client_address: {:?}, enc_key: {:?}, domain: {:?}, typed_ciphertexts_count: {} }}",
-        request.request_id, request.key_id, request.context_id, request.epoch_id, request.client_address, hex::encode(&request.enc_key), request.domain, request.typed_ciphertexts.len(),
+        request.request_id,
+        request.key_id,
+        request.context_id,
+        request.epoch_id,
+        request.client_address,
+        hex::encode(&request.enc_key),
+        request.domain,
+        request.typed_ciphertexts.len(),
     )
 }
 
@@ -633,11 +654,11 @@ mod tests {
     use aes_prng::AesRng;
     use kms_grpc::{
         kms::v1::CiphertextFormat,
-        rpc_types::{alloy_to_protobuf_domain, KMSType},
+        rpc_types::{KMSType, alloy_to_protobuf_domain},
     };
     use rand::SeedableRng;
     use tfhe::FheTypes;
-    use threshold_fhe::execution::{
+    use threshold_execution::{
         runtime::sessions::session_parameters::GenericParameterHandles,
         small_execution::prss::PRSSSetup, tfhe_internals::utils::expanded_encrypt,
     };
@@ -661,9 +682,7 @@ mod tests {
     impl NoiseFloodPartialDecryptor for DummyNoiseFloodPartialDecryptor {
         type Prep = SmallOfflineNoiseFloodSession<
             { ResiduePolyF4Z128::EXTENSION_DEGREE },
-            threshold_fhe::execution::runtime::sessions::small_session::SmallSession<
-                ResiduePolyF4Z128,
-            >,
+            SmallSession<ResiduePolyF4Z128>,
         >;
 
         async fn partial_decrypt(
@@ -764,10 +783,13 @@ mod tests {
                 fhe_key_set,
                 Arc::clone(&key_meta_store),
             )
-            .await;
+            .await
+            .unwrap_or_else(|_| {
+                panic!("failed to write threshold keys for key {key_id} in test setup")
+            });
 
         {
-            // check existance
+            // check existence
             let _guard = user_decryptor
                 .crypto_storage
                 .read_guarded_threshold_fhe_keys(&key_id, &epoch_id)

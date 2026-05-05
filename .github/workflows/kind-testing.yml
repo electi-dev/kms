@@ -10,6 +10,14 @@ on:
         required: false
         type: string
     secrets:
+      ZWS_BOT_TOKEN:
+        required: true
+      HARBOR_URL:
+        required: true
+      HARBOR_READ_LOGIN:
+        required: true
+      HARBOR_READ_TOKEN:
+        required: true
       BLOCKCHAIN_ACTIONS_TOKEN:
         required: true
       SLAB_ACTION_TOKEN:
@@ -17,8 +25,6 @@ on:
       SLAB_BASE_URL:
         required: true
       JOB_SECRET:
-        required: true
-      ZWS_BOT_TOKEN:
         required: true
       AWS_ACCESS_KEY_S3_USER:
         required: true
@@ -80,7 +86,7 @@ jobs:
     steps:
       - name: Start EC2 runner
         id: start-ec2-runner
-        uses: zama-ai/slab-github-runner@0a812986560d3f10dc65728b1ccb9ae4c48a8a16 # v1.5.1
+        uses: zama-ai/slab-github-runner@5aee5d157f4a0201e5eaefc9cc648e5f9f5472a5 # v1.6.0
         with:
           mode: start
           github-token: ${{ secrets.SLAB_ACTION_TOKEN }}
@@ -100,7 +106,7 @@ jobs:
     steps:
       - name: Start EC2 runner
         id: start-ec2-runner
-        uses: zama-ai/slab-github-runner@0a812986560d3f10dc65728b1ccb9ae4c48a8a16 # v1.5.1
+        uses: zama-ai/slab-github-runner@5aee5d157f4a0201e5eaefc9cc648e5f9f5472a5 # v1.6.0
         with:
           mode: start
           github-token: ${{ secrets.SLAB_ACTION_TOKEN }}
@@ -120,7 +126,7 @@ jobs:
     steps:
       - name: Start EC2 runner
         id: start-ec2-runner
-        uses: zama-ai/slab-github-runner@0a812986560d3f10dc65728b1ccb9ae4c48a8a16 # v1.5.1
+        uses: zama-ai/slab-github-runner@5aee5d157f4a0201e5eaefc9cc648e5f9f5472a5 # v1.6.0
         with:
           mode: start
           github-token: ${{ secrets.SLAB_ACTION_TOKEN }}
@@ -205,7 +211,7 @@ jobs:
       #
       - name: Set up Docker Buildx
         if: matrix.cargo-check == false
-        uses: docker/setup-buildx-action@d70bba72b1f3fd22344832f00baa16ece964efeb # v3.3.0
+        uses: ./.github/actions/docker-setup-buildx
         with:
           platforms: linux/amd64 # Target platform for builds
           buildkitd-flags: --debug # Enable debug logging for BuildKit
@@ -245,36 +251,37 @@ jobs:
           ./get_helm.sh
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_S3_USER }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY_S3_USER }}
           aws-region: eu-west-3
 
       # Needed to be able to pull some docker images for the simulator test
-      - name: Login to zws GitHub Container Registry
+      - name: Login to harbor Container Registry
         if: matrix.cargo-check == false
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        uses: ./.github/actions/docker-login
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.ZWS_BOT_TOKEN }}
+          registry: ${{ secrets.HARBOR_URL }}
+          username: ${{ secrets.HARBOR_READ_LOGIN }}
+          password: ${{ secrets.HARBOR_READ_TOKEN }}
 
       # ==========================================================================
       # Rust toolchain setup
       #
       - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+        uses: ./.github/actions/setup-rust-and-protoc
         with:
-          toolchain: ${{ env.RUST_IMAGE_VERSION }}
-          components: rustfmt, clippy, llvm-tools-preview, llvm-tools
-          cache: false
+          rust-toolchain: ${{ env.RUST_IMAGE_VERSION }}
+          rust-components: rustfmt, clippy, llvm-tools-preview, llvm-tools
+          rust-cache: "false"
+          setup-protoc: "false"
 
       # ==========================================================================
       # Setup cache for dockerfile and inject in docker
       #
       - name: Setup Cache
-        uses: runs-on/cache@a10d0f887093e2bc9de875be9edf8ab98c94a154 # v4.3.0
+        uses: runs-on/cache@a5f51d6f3fece787d03b7b4e981c82538a0654ed # latest commit on `v4` branch at this time
         id: cache
         env:
           RUNS_ON_S3_BUCKET_CACHE: gh-actions-cache-eu-west-3
@@ -290,10 +297,11 @@ jobs:
             ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        uses: ./.github/actions/setup-rust-and-protoc
         with:
-          version: '26.x'
-          repo-token: ${{ secrets.GITHUB_TOKEN }} # Add github token to avoid rate limit see docs https://github.com/arduino/setup-protoc
+          setup-rust: "false"
+          protoc-version: '26.1'
+          protoc-repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup cargo nextest and grcov
         if: matrix.cargo-check == false
@@ -339,6 +347,8 @@ jobs:
         env:
           DEPLOYMENT_TYPE: ${{ matrix.deployment-type }} # Deployment type: threshold or centralized
           GITHUB_TOKEN: ${{ secrets.ZWS_BOT_TOKEN }}
+          HARBOR_READ_LOGIN: ${{ secrets.HARBOR_READ_LOGIN }}
+          HARBOR_READ_TOKEN: ${{ secrets.HARBOR_READ_TOKEN }}
           KMS_CORE_IMAGE_TAG: ${{ inputs.image_tag || needs.docker-build.outputs.image_tag }}
           KMS_CORE_CLIENT_IMAGE_TAG: ${{ inputs.image_tag || needs.docker-build.outputs.image_tag }}
           NAMESPACE: kms-test-${{ matrix.deployment-type }}
@@ -387,7 +397,7 @@ jobs:
           if find "${NEXTEST_OUT}" -mindepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
             echo "Files found in ${NEXTEST_OUT}"
             ls -R "${NEXTEST_OUT}"
-            echo "TIMESTAMP=$(date +"%Y%m%d%H%M%S")" >> "$GITHUB_ENV"
+            echo "TIMESTAMP=$(date +"%Y%m%d%H%M%S%3N")" >> "$GITHUB_ENV"
             cp -Lpr "${NEXTEST_OUT}"/junit.xml /tmp/junit.xml
             echo "EXIT_CODE=0" >> "$GITHUB_ENV"
           else
@@ -399,7 +409,7 @@ jobs:
 
       - name: Upload Test Results
         if: always() && !cancelled() && env.EXIT_CODE == 0
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: junit-test-report-${{ env.TIMESTAMP }}
           path: /tmp/junit.xml
@@ -428,16 +438,32 @@ jobs:
           chmod +x ci/scripts/manage_lifecycle.sh
           ./ci/scripts/manage_lifecycle.sh stop "${SETUP_PID}" "${TAIL_PID}"
 
-      - name: Upload kms-core logs
+      - name: Detect kms-core logs
         if: always() && matrix.cargo-check == false
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        id: detect-kms-logs
+        run: |
+          shopt -s nullglob
+          files=(logs/*.log logs/port-forward/*.log setup_kms.log)
+          if [ ${#files[@]} -gt 0 ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Found ${#files[@]} log files for upload."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No kms-core logs found; skipping artifact upload."
+          fi
+        shell: bash
+
+      - name: Upload kms-core logs
+        if: always() && matrix.cargo-check == false && steps.detect-kms-logs.outputs.found == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: kms-core-${{ matrix.deployment-type }}-logs
           path: |
-            /tmp/kms-service-*.log
-            /tmp/kms-core-*.log
+            logs/*.log
+            logs/port-forward/*.log
+            setup_kms.log
           retention-days: 7 # Keep logs for 7 days
-          if-no-files-found: warn # Only warn if no log files are found
+          if-no-files-found: error
 
       - name: Check Test Results
         if: always() && matrix.cargo-check == false
@@ -534,7 +560,7 @@ jobs:
     if: ${{ always() && needs.start-runner-cargo.result == 'success' }}
     steps:
       - name: Stop EC2 runner
-        uses: zama-ai/slab-github-runner@0a812986560d3f10dc65728b1ccb9ae4c48a8a16 # v1.5.1
+        uses: zama-ai/slab-github-runner@5aee5d157f4a0201e5eaefc9cc648e5f9f5472a5 # v1.6.0
         with:
           mode: stop
           github-token: ${{ secrets.SLAB_ACTION_TOKEN }}
@@ -551,7 +577,7 @@ jobs:
     if: ${{ always() && needs.start-runner-threshold.result == 'success' }}
     steps:
       - name: Stop EC2 runner
-        uses: zama-ai/slab-github-runner@0a812986560d3f10dc65728b1ccb9ae4c48a8a16 # v1.5.1
+        uses: zama-ai/slab-github-runner@5aee5d157f4a0201e5eaefc9cc648e5f9f5472a5 # v1.6.0
         with:
           mode: stop
           github-token: ${{ secrets.SLAB_ACTION_TOKEN }}
@@ -568,7 +594,7 @@ jobs:
     if: ${{ always() && needs.start-runner-centralized.result == 'success' }}
     steps:
       - name: Stop EC2 runner
-        uses: zama-ai/slab-github-runner@0a812986560d3f10dc65728b1ccb9ae4c48a8a16 # v1.5.1
+        uses: zama-ai/slab-github-runner@5aee5d157f4a0201e5eaefc9cc648e5f9f5472a5 # v1.6.0
         with:
           mode: stop
           github-token: ${{ secrets.SLAB_ACTION_TOKEN }}

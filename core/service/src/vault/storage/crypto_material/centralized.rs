@@ -7,25 +7,22 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use kms_grpc::{
+    RequestId,
     identifiers::EpochId,
     rpc_types::{KMSType, PrivDataType, PubDataType},
-    RequestId,
 };
-use tfhe::{
-    integer::compression_keys::DecompressionKey, xof_key_set::CompressedXofKeySet,
-    zk::CompactPkeCrs,
-};
-use threshold_fhe::execution::tfhe_internals::public_keysets::FhePubKeySet;
+use tfhe::{integer::compression_keys::DecompressionKey, xof_key_set::CompressedXofKeySet};
+use threshold_execution::tfhe_internals::public_keysets::FhePubKeySet;
 
 use crate::{
-    engine::base::{CrsGenMetadata, KeyGenMetadata, KmsFheKeyHandles},
+    engine::base::{KeyGenMetadata, KmsFheKeyHandles},
     util::meta_store::MetaStore,
     vault::{
-        storage::{
-            store_versioned_at_request_and_epoch_id, store_versioned_at_request_id, Storage,
-            StorageExt,
-        },
         Vault,
+        storage::{
+            Storage, StorageExt, store_versioned_at_request_and_epoch_id,
+            store_versioned_at_request_id,
+        },
     },
 };
 
@@ -61,25 +58,6 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
         }
     }
 
-    /// Write the CRS to the storage backend as well as the cache,
-    /// and update the [meta_store] to "Done" if the procedure is successful.
-    ///
-    /// When calling this function more than once, the same [meta_store]
-    /// must be used, otherwise the storage state may become inconsistent.
-    pub async fn write_crs_with_meta_store(
-        &self,
-        crs_id: &RequestId,
-        epoch_id: &EpochId,
-        pp: CompactPkeCrs,
-        crs_info: CrsGenMetadata,
-        meta_store: Arc<RwLock<MetaStore<CrsGenMetadata>>>,
-        op_metric_tag: &'static str,
-    ) {
-        self.inner
-            .write_crs_with_meta_store(crs_id, epoch_id, pp, crs_info, meta_store, op_metric_tag)
-            .await
-    }
-
     pub async fn write_decompression_key_with_meta_store(
         &self,
         req_id: &RequestId,
@@ -105,7 +83,7 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
         key_info: KmsFheKeyHandles,
         fhe_key_set: FhePubKeySet,
         meta_store: Arc<RwLock<MetaStore<KeyGenMetadata>>>,
-    ) {
+    ) -> anyhow::Result<()> {
         // use guarded_meta_store as the synchronization point
         // all other locks are taken as needed so that we don't lock up
         // other function calls too much
@@ -119,12 +97,7 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
 
         let f1 = async {
             let mut priv_storage = self.inner.private_storage.lock().await;
-            // can't map() because async closures aren't stable in Rust
-            let back_vault = match self.inner.backup_vault {
-                Some(ref x) => Some(x.lock().await),
-                None => None,
-            };
-            let store_result_1 = store_versioned_at_request_and_epoch_id(
+            let store_result = store_versioned_at_request_and_epoch_id(
                 &mut (*priv_storage),
                 key_id,
                 epoch_id,
@@ -132,37 +105,14 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
                 &PrivDataType::FhePrivateKey.to_string(),
             )
             .await;
-            if let Err(e) = &store_result_1 {
+            if let Err(e) = &store_result {
                 tracing::error!(
                     "Failed to store FHE key info to private storage for request {}: {}",
                     key_id,
                     e
                 );
             }
-            let store_err_1 = store_result_1.is_err();
-
-            let store_err_2 = match back_vault {
-                Some(mut x) => {
-                    let result = store_versioned_at_request_and_epoch_id(
-                        &mut (*x),
-                        key_id,
-                        epoch_id,
-                        &key_info,
-                        &PrivDataType::FhePrivateKey.to_string(),
-                    )
-                    .await;
-                    if let Err(e) = &result {
-                        tracing::error!(
-                            "Failed to store FHE key info to backup storage for request {}: {}",
-                            key_id,
-                            e
-                        );
-                    }
-                    result.is_err()
-                }
-                None => false,
-            };
-            !(store_err_1 || store_err_2)
+            store_result.is_ok()
         };
 
         let f2 = async {
@@ -197,17 +147,10 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
         };
 
         let (r1, r2, r3) = tokio::join!(f1, f2, f3);
-        if r1
-            && r2
-            && r3
-            && guarded_meta_store
-                .update(key_id, Ok(key_info.public_key_info.to_owned()))
-                .inspect_err(|e| {
-                    tracing::error!("Error ({e}) while updating PK meta store for {}", key_id)
-                })
-                .is_ok()
-        {
-            {
+        if r1 && r2 && r3 {
+            let meta_update =
+                guarded_meta_store.update(key_id, Ok(key_info.public_key_info.clone()));
+            if meta_update.is_ok() {
                 let mut guarded_fhe_keys = self.fhe_keys.write().await;
                 let previous = guarded_fhe_keys.insert((*key_id, *epoch_id), key_info);
                 if previous.is_some() {
@@ -220,6 +163,18 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
                     "Successfully stored centralized keygen material for request {}",
                     key_id
                 );
+                Ok(())
+            } else {
+                // Try to delete stored data to avoid anything dangling
+                // Ignore any failure to delete something since
+                // it might be because the data did not get created
+                // In any case, we can't do much.
+                self.inner
+                    .purge_key_material(key_id, epoch_id, KMSType::Centralized, guarded_meta_store)
+                    .await;
+                meta_update.map_err(|e| {
+                    anyhow::anyhow!("Error while updating PK meta store for {key_id}: {e}")
+                })
             }
         } else {
             // Try to delete stored data to avoid anything dangling
@@ -229,6 +184,7 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
             self.inner
                 .purge_key_material(key_id, epoch_id, KMSType::Centralized, guarded_meta_store)
                 .await;
+            anyhow::bail!("Storage write failed for key {key_id}");
         }
     }
 
@@ -244,8 +200,9 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
         epoch_id: &EpochId,
         key_info: KmsFheKeyHandles,
         compressed_keyset: &CompressedXofKeySet,
+        compact_public_key: &tfhe::CompactPublicKey,
         meta_store: Arc<RwLock<MetaStore<KeyGenMetadata>>>,
-    ) {
+    ) -> anyhow::Result<()> {
         self.inner
             .write_compressed_keys_with_dkg_meta_store(
                 key_id,
@@ -253,6 +210,7 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
                 key_info,
                 PrivDataType::FhePrivateKey,
                 compressed_keyset,
+                compact_public_key,
                 meta_store,
                 Arc::clone(&self.fhe_keys),
             )

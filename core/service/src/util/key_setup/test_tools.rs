@@ -8,8 +8,8 @@ use crate::util::key_setup::FhePublicKey;
 use crate::vault::keychain::make_keychain_proxy;
 use crate::vault::storage::file::FileStorage;
 use crate::vault::storage::{
-    delete_all_at_request_id, delete_at_request_and_epoch_id, make_storage,
-    read_versioned_at_request_id, StorageReader, StorageReaderExt, StorageType,
+    StorageReader, StorageReaderExt, StorageType, delete_all_at_request_id,
+    delete_at_request_and_epoch_id, make_storage, read_versioned_at_request_id,
 };
 use crate::vault::{Vault, VaultDataType};
 use kms_grpc::kms::v1::{CiphertextFormat, TypedPlaintext};
@@ -23,11 +23,11 @@ use tfhe::prelude::SquashNoise;
 use tfhe::prelude::Tagged;
 use tfhe::safe_serialization::safe_serialize;
 use tfhe::{
-    FheBool, FheTypes, FheUint128, FheUint16, FheUint160, FheUint256, FheUint32, FheUint64,
-    FheUint8, HlCompactable, HlCompressible, HlExpandable, HlSquashedNoiseCompressible, ServerKey,
-    Unversionize, Versionize,
+    FheBool, FheTypes, FheUint8, FheUint16, FheUint32, FheUint64, FheUint128, FheUint160,
+    FheUint256, HlCompactable, HlCompressible, HlExpandable, HlSquashedNoiseCompressible,
+    ServerKey, Unversionize, Versionize,
 };
-use threshold_fhe::execution::tfhe_internals::utils::expanded_encrypt;
+use threshold_execution::tfhe_internals::utils::expanded_encrypt;
 
 fn enc_and_serialize_ctxt<M, T>(
     msg: M,
@@ -336,19 +336,9 @@ pub async fn compute_cipher_from_stored_key(
     key_id: &RequestId,
     storage_prefix: Option<&str>,
     enc_config: EncryptionConfig,
-    compressed_keys: bool,
+    uncompressed_keys: bool,
 ) -> (Vec<u8>, CiphertextFormat, FheTypes) {
-    let (pk, server_key) = if compressed_keys {
-        // Load compressed keys and decompress them
-        let xof_keyset: tfhe::xof_key_set::CompressedXofKeySet = load_material_from_pub_storage(
-            pub_path,
-            key_id,
-            PubDataType::CompressedXofKeySet,
-            storage_prefix,
-        )
-        .await;
-        xof_keyset.decompress().unwrap().into_raw_parts()
-    } else {
+    let (pk, server_key) = if uncompressed_keys {
         let pk = load_pk_from_pub_storage(pub_path, key_id, storage_prefix).await;
         let server_key: ServerKey = load_material_from_pub_storage(
             pub_path,
@@ -358,6 +348,16 @@ pub async fn compute_cipher_from_stored_key(
         )
         .await;
         (pk, server_key)
+    } else {
+        // Load the default compressed keyset and decompress it for test encryption.
+        let xof_keyset: tfhe::xof_key_set::CompressedXofKeySet = load_material_from_pub_storage(
+            pub_path,
+            key_id,
+            PubDataType::CompressedXofKeySet,
+            storage_prefix,
+        )
+        .await;
+        xof_keyset.decompress().unwrap().into_raw_parts()
     };
 
     // compute_cipher can take a long time since it may do SnS
@@ -585,14 +585,14 @@ pub(crate) mod setup {
     #[cfg(feature = "slow_tests")]
     use crate::consts::{TEST_THRESHOLD_CRS_ID_13P, TEST_THRESHOLD_KEY_ID_13P};
     use crate::util::key_setup::{
-        ensure_central_crs_exists, ensure_central_keys_exist, ensure_client_keys_exist,
-        ThresholdSigningKeyConfig,
+        ThresholdSigningKeyConfig, ensure_central_crs_exists, ensure_central_keys_exist,
+        ensure_client_keys_exist,
     };
     use crate::{
         consts::{
             KEY_PATH_PREFIX, OTHER_CENTRAL_TEST_ID, SIGNING_KEY_ID, TEST_CENTRAL_CRS_ID,
-            TEST_CENTRAL_KEY_ID, TEST_PARAM, TEST_THRESHOLD_CRS_ID_10P, TEST_THRESHOLD_CRS_ID_4P,
-            TEST_THRESHOLD_KEY_ID_10P, TEST_THRESHOLD_KEY_ID_4P, TMP_PATH_PREFIX,
+            TEST_CENTRAL_KEY_ID, TEST_PARAM, TEST_THRESHOLD_CRS_ID_4P, TEST_THRESHOLD_CRS_ID_10P,
+            TEST_THRESHOLD_KEY_ID_4P, TEST_THRESHOLD_KEY_ID_10P, TMP_PATH_PREFIX,
         },
         util::key_setup::ensure_central_server_signing_keys_exist,
     };
@@ -601,12 +601,12 @@ pub(crate) mod setup {
             ensure_threshold_crs_exists, ensure_threshold_keys_exist,
             ensure_threshold_server_signing_keys_exist,
         },
-        vault::storage::{file::FileStorage, StorageType},
+        vault::storage::{StorageType, file::FileStorage},
     };
-    use kms_grpc::identifiers::EpochId;
     use kms_grpc::RequestId;
+    use kms_grpc::identifiers::EpochId;
     use std::path::Path;
-    use threshold_fhe::execution::tfhe_internals::parameters::DKGParams;
+    use threshold_execution::tfhe_internals::parameters::DKGParams;
 
     pub async fn ensure_dir_exist(path: Option<&Path>) {
         match path {
@@ -676,13 +676,13 @@ pub(crate) mod setup {
         testing_material(path).await;
     }
 
-    #[cfg(feature = "slow_tests")]
+    #[allow(dead_code)]
     async fn default_material() {
         use crate::consts::{
             DEFAULT_CENTRAL_CRS_ID, DEFAULT_CENTRAL_KEY_ID, DEFAULT_PARAM,
-            DEFAULT_THRESHOLD_CRS_ID_10P, DEFAULT_THRESHOLD_CRS_ID_13P,
-            DEFAULT_THRESHOLD_CRS_ID_4P, DEFAULT_THRESHOLD_KEY_ID_10P,
-            DEFAULT_THRESHOLD_KEY_ID_13P, DEFAULT_THRESHOLD_KEY_ID_4P, OTHER_CENTRAL_DEFAULT_ID,
+            DEFAULT_THRESHOLD_CRS_ID_4P, DEFAULT_THRESHOLD_CRS_ID_10P,
+            DEFAULT_THRESHOLD_CRS_ID_13P, DEFAULT_THRESHOLD_KEY_ID_4P,
+            DEFAULT_THRESHOLD_KEY_ID_10P, DEFAULT_THRESHOLD_KEY_ID_13P, OTHER_CENTRAL_DEFAULT_ID,
         };
         ensure_dir_exist(None).await;
         let epoch_id = *DEFAULT_EPOCH_ID;
@@ -825,7 +825,7 @@ pub(crate) mod setup {
         .await;
     }
 
-    #[cfg(feature = "slow_tests")]
+    #[allow(dead_code)]
     pub(crate) async fn ensure_default_material_exists() {
         default_material().await;
     }

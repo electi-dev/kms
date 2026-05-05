@@ -1,6 +1,6 @@
 use super::{
-    custodian::{InternalCustodianSetupMessage, HEADER},
-    error::BackupError,
+    custodian::{HEADER, InternalCustodianSetupMessage},
+    error::{BackupError, SetupSkipReason},
     secretsharing,
 };
 use crate::{
@@ -22,9 +22,14 @@ use crate::{
     backup::custodian::{InternalCustodianContext, InternalCustodianRecoveryOutput},
     engine::validation::parse_optional_grpc_request_id,
 };
+use algebra::{
+    galois_rings::degree_4::ResiduePolyF4Z64,
+    sharing::{shamir::ShamirSharings, share::Share},
+};
+use hashing::DomainSep;
 use kms_grpc::{
+    ContextId, RequestId,
     kms::v1::{OperatorBackupOutput, RecoveryRequest},
-    RequestId,
 };
 use rand::{CryptoRng, Rng};
 use serde::{Deserialize, Serialize};
@@ -33,16 +38,9 @@ use std::{
     fmt::Display,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tfhe::{named::Named, safe_serialization::safe_deserialize, Versionize};
-use tfhe_versionable::VersionsDispatch;
-use threshold_fhe::{
-    algebra::galois_rings::degree_4::ResiduePolyF4Z64,
-    execution::{
-        runtime::party::Role,
-        sharing::{shamir::ShamirSharings, share::Share},
-    },
-    hashing::DomainSep,
-};
+use tfhe::{named::Named, safe_serialization::safe_deserialize};
+use tfhe_versionable::{Versionize, VersionsDispatch};
+use threshold_types::role::Role;
 
 pub const DSEP_BACKUP_COMMITMENT: DomainSep = *b"BKUPCOMM";
 pub(crate) const DSEP_BACKUP_RECOVERY: DomainSep = *b"BKUPRECO";
@@ -243,6 +241,15 @@ impl TryFrom<InnerOperatorBackupOutput> for OperatorBackupOutput {
     }
 }
 
+/// Result of [`Operator::secret_share_and_signcrypt`] including roles that
+/// were skipped because no custodian key was available.
+#[derive(Debug, Clone)]
+pub struct SigncryptResult {
+    pub ct_shares: BTreeMap<Role, InnerOperatorBackupOutput>,
+    pub commitments: BTreeMap<Role, Vec<u8>>,
+    pub skipped_roles: Vec<Role>,
+}
+
 fn verify_n_t(n: usize, t: usize) -> Result<(), BackupError> {
     if n == 0 {
         return Err(BackupError::SetupError("n cannot be 0".to_string()));
@@ -285,6 +292,7 @@ impl RecoveryValidationMaterial {
         commitments: BTreeMap<Role, Vec<u8>>,
         custodian_context: InternalCustodianContext,
         sk: &PrivateSigKey,
+        mpc_context: ContextId,
     ) -> anyhow::Result<Self> {
         if custodian_context.custodian_nodes.len() != cts.len() {
             return Err(anyhow::anyhow!(
@@ -306,6 +314,7 @@ impl RecoveryValidationMaterial {
             cts,
             commitments,
             custodian_context,
+            mpc_context,
         };
         let serialized_payload = bc2wrap::serialize(&payload).map_err(|e| {
             anyhow_error_and_log(format!("Could not serialize inner recovery request: {e:?}"))
@@ -389,6 +398,8 @@ pub struct RecoveryValidationMaterialPayload {
     pub commitments: BTreeMap<Role, Vec<u8>>,
     /// The custodian context used during backup
     pub custodian_context: InternalCustodianContext,
+    /// The MPC context used when constructing the backup (i.e. identifying the verification key of the operator)
+    pub mpc_context: ContextId,
 }
 impl Named for RecoveryValidationMaterialPayload {
     const NAME: &'static str = "backup::RecoveryValidationMaterialPayload";
@@ -505,10 +516,10 @@ impl Operator {
         amount_custodians: usize,
     ) -> Result<Self, BackupError> {
         let verf_key = signing_key.verf_key();
-        let custodian_keys =
+        let validated =
             validate_custodian_messages(custodian_messages, threshold, amount_custodians, true)?;
         Ok(Self {
-            custodian_keys,
+            custodian_keys: validated.keys,
             signing_key: Some(signing_key),
             verification_key: verf_key,
             threshold,
@@ -524,10 +535,10 @@ impl Operator {
         threshold: usize,
         amount_custodians: usize,
     ) -> Result<Self, BackupError> {
-        let custodian_keys =
+        let validated =
             validate_custodian_messages(custodian_messages, threshold, amount_custodians, false)?;
         Ok(Self {
-            custodian_keys,
+            custodian_keys: validated.keys,
             signing_key: None,
             verification_key: verf_key,
             threshold,
@@ -538,11 +549,15 @@ impl Operator {
         &self.verification_key
     }
 
+    #[cfg(test)]
+    pub fn num_custodian_keys(&self) -> usize {
+        self.custodian_keys.len()
+    }
+
     // We allow the following lints because we are fine with mutating the rng even if
     // the function fails afterwards.
     #[allow(unknown_lints)]
     #[allow(non_local_effect_before_error_return)]
-    #[allow(clippy::type_complexity)]
     /// Construct a secret sharing of a `secret` and return a map of the basic backup recovery material,
     /// indexed by the role of each custodian. Also return a map of each commitment to the secret share,
     /// indexed by the role of each custodian.
@@ -552,18 +567,12 @@ impl Operator {
         rng: &mut R,
         secret: &[u8],
         backup_id: RequestId,
-    ) -> Result<
-        (
-            BTreeMap<Role, InnerOperatorBackupOutput>,
-            BTreeMap<Role, Vec<u8>>,
-        ),
-        BackupError,
-    > {
+    ) -> Result<SigncryptResult, BackupError> {
         let sk = match &self.signing_key {
             None => {
                 return Err(BackupError::OperatorError(
                     "Operator has no signing key".to_string(),
-                ))
+                ));
             }
             Some(sk) => sk,
         };
@@ -600,6 +609,7 @@ impl Operator {
 
         let mut ct_shares: BTreeMap<Role, _> = BTreeMap::new();
         let mut commitments: BTreeMap<Role, _> = BTreeMap::new();
+        let mut skipped_roles: Vec<Role> = Vec::new();
 
         // Zip_eq will panic in case the two iterators are not of the same length.
         // Since `plain_ij` is created in this method from `shares` such a panic can only happen in case of a bug in this method
@@ -623,6 +633,7 @@ impl Operator {
                 None => {
                     // Note that we do not error out since we might now have gotten all the expected correct custodian setup messages
                     tracing::warn!("Could not find custodian keys for role {role_j}");
+                    skipped_roles.push(role_j);
                     continue;
                 }
             };
@@ -659,13 +670,17 @@ impl Operator {
 
         if ct_shares.len() < self.threshold + 1 {
             return Err(BackupError::OperatorError(format!(
-                "Not enough valid custodian shares were created: expected at least {} but got {}",
+                "Not enough valid custodian shares were created: expected at least {} but got {}, skipped roles: {skipped_roles:?}",
                 self.threshold + 1,
                 ct_shares.len()
             )));
         }
         // 6. The commitments are stored by `P_i` and can be used to verify the shares later.
-        Ok((ct_shares, commitments))
+        Ok(SigncryptResult {
+            ct_shares,
+            commitments,
+            skipped_roles,
+        })
     }
 
     /// Operators that does the recovery collects all the materials
@@ -743,19 +758,28 @@ impl Operator {
 /// Helper function to validate custodian setup messages and parameters.
 /// The function returns a HashMap mapping the valid custodian roles to their encryption and verification keys.
 /// That is, the method precludes any invalid custodian messages, and returns an error if not enough valid.
+/// Successful result from [`validate_custodian_messages`] carrying both the
+/// validated keys and the reasons any messages were skipped.
+#[derive(Debug)]
+struct CustodianValidationResult {
+    keys: HashMap<Role, (UnifiedPublicEncKey, PublicSigKey)>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    skip_reasons: Vec<SetupSkipReason>,
+}
+
 fn validate_custodian_messages(
     custodian_messages: Vec<InternalCustodianSetupMessage>,
     threshold: usize,
     amount_custodians: usize,
     validate_timestamps: bool,
-) -> Result<HashMap<Role, (UnifiedPublicEncKey, PublicSigKey)>, BackupError> {
+) -> Result<CustodianValidationResult, BackupError> {
     verify_n_t(amount_custodians, threshold)?;
     if custodian_messages.len() != amount_custodians {
         tracing::warn!(
-                "An incorrect amount of custodian messages were received: expected at least {} but got {}",
-                amount_custodians,
-                custodian_messages.len()
-            );
+            "An incorrect amount of custodian messages were received: expected at least {} but got {}",
+            amount_custodians,
+            custodian_messages.len()
+        );
         if custodian_messages.len() < threshold + 1 {
             let msg = format!(
                 "Not enough custodian setup messages: expected at least {} but got {}",
@@ -767,6 +791,7 @@ fn validate_custodian_messages(
         }
     }
     let mut custodian_keys = HashMap::new();
+    let mut skip_reasons: Vec<SetupSkipReason> = Vec::new();
     for msg in custodian_messages.into_iter() {
         let InternalCustodianSetupMessage {
             header,
@@ -785,8 +810,8 @@ fn validate_custodian_messages(
                 custodian_role
             );
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-            if !(now - TIMESTAMP_VALIDATION_WINDOW_SECS < timestamp
-                && timestamp < now + TIMESTAMP_VALIDATION_WINDOW_SECS)
+            if !(now.saturating_sub(TIMESTAMP_VALIDATION_WINDOW_SECS) < timestamp
+                && timestamp < now.saturating_add(TIMESTAMP_VALIDATION_WINDOW_SECS))
             {
                 tracing::warn!(
                     "Invalid timestamp in custodian setup message from custodian {}: expected within {} seconds of now, but got {}",
@@ -794,18 +819,23 @@ fn validate_custodian_messages(
                     TIMESTAMP_VALIDATION_WINDOW_SECS,
                     timestamp
                 );
+                skip_reasons.push(SetupSkipReason::InvalidTimestamp);
                 continue;
             }
         }
         if header != HEADER {
-            tracing::warn!("Invalid header in custodian setup message from custodian {custodian_role}. Expected header {HEADER} but got {header}");
+            tracing::warn!(
+                "Invalid header in custodian setup message from custodian {custodian_role}. Expected header {HEADER} but got {header}"
+            );
+            skip_reasons.push(SetupSkipReason::InvalidHeader);
             continue;
         }
 
         if custodian_role.one_based() > amount_custodians {
             tracing::warn!(
-                    "Invalid custodian role in custodian setup message: {custodian_role}. Expected role between 1 and {amount_custodians}"
-                );
+                "Invalid custodian role in custodian setup message: {custodian_role}. Expected role between 1 and {amount_custodians}"
+            );
+            skip_reasons.push(SetupSkipReason::InvalidRole);
             continue;
         }
 
@@ -813,31 +843,42 @@ fn validate_custodian_messages(
             custodian_keys.insert(custodian_role, (public_enc_key, public_verf_key))
         {
             tracing::warn!(
-                        "Duplicate custodian role in custodian setup message: {custodian_role}. Will use first value for this role"
-                    );
+                "Duplicate custodian role in custodian setup message: {custodian_role}. Will use first value for this role"
+            );
             let _ = custodian_keys.insert(custodian_role, old_val);
+            skip_reasons.push(SetupSkipReason::DuplicateRole);
             continue;
         }
     }
     if custodian_keys.len() < threshold + 1 {
-        let msg = format!(
-            "Not enough valid custodian setup messages: expected at least {} but got {}",
-            threshold + 1,
-            custodian_keys.len()
+        let expected_min = threshold + 1;
+        let received = custodian_keys.len();
+        tracing::error!(
+            expected_min,
+            received,
+            ?skip_reasons,
+            "Not enough valid custodian setup messages"
         );
-        tracing::error!("{msg}");
-        return Err(BackupError::SetupError(msg));
+        return Err(BackupError::SetupValidationFailed {
+            expected_min,
+            received,
+            skipped: skip_reasons,
+        });
     }
-    Ok(custodian_keys)
+    Ok(CustodianValidationResult {
+        keys: custodian_keys,
+        skip_reasons,
+    })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         backup::{custodian::CustodianSetupMessagePayload, operator::RecoveryValidationMaterial},
+        consts::DEFAULT_MPC_CONTEXT,
         cryptography::{
             encryption::{Encryption, PkeScheme, PkeSchemeType},
-            signatures::{gen_sig_keys, SigningSchemeType},
+            signatures::{SigningSchemeType, gen_sig_keys},
         },
         engine::base::derive_request_id,
     };
@@ -895,14 +936,19 @@ mod tests {
         cts.insert(Role::indexed_from_one(3), cts_out.clone());
         let custodian_context = CustodianContext {
             custodian_nodes: vec![setup_msg1, setup_msg2, setup_msg3],
-            context_id: Some(backup_id.into()),
+            custodian_context_id: Some(backup_id.into()),
             threshold: 1,
         };
         let internal_custodian_context =
             InternalCustodianContext::new(custodian_context, enc_key).unwrap();
-        let rvm =
-            RecoveryValidationMaterial::new(cts, commitments, internal_custodian_context, &sig_key)
-                .unwrap();
+        let rvm = RecoveryValidationMaterial::new(
+            cts,
+            commitments,
+            internal_custodian_context,
+            &sig_key,
+            *DEFAULT_MPC_CONTEXT,
+        )
+        .unwrap();
         assert!(rvm.validate(&verf_key));
     }
 
@@ -925,16 +971,29 @@ mod tests {
         }
     }
 
+    fn expect_setup_validation_failed(err: BackupError) -> (usize, Vec<SetupSkipReason>) {
+        match err {
+            BackupError::SetupValidationFailed {
+                received, skipped, ..
+            } => (received, skipped),
+            other => {
+                panic!("expected SetupValidationFailed, got: {other}");
+            }
+        }
+    }
+
     #[test]
     fn operator_new_fails_with_bad_n_t() {
         // 1 is not less than 2/2
         let result = validate_custodian_messages(vec![], 1, 2, true);
         assert!(matches!(result, Err(BackupError::SetupError(_))));
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("t < n/2 is not satisfied"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("t < n/2 is not satisfied")
+        );
     }
 
     #[test]
@@ -960,14 +1019,15 @@ mod tests {
         let msg = valid_custodian_msg(Role::indexed_from_one(1), enc_key.clone(), verf_key.clone());
         let result = validate_custodian_messages(vec![msg], 1, 3, true);
         assert!(matches!(result, Err(BackupError::SetupError(_))));
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Not enough custodian setup messages"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Not enough custodian setup messages")
+        );
     }
 
-    #[tracing_test::traced_test]
     #[test]
     fn operator_new_fails_with_invalid_header() {
         let mut rng = AesRng::seed_from_u64(5);
@@ -981,13 +1041,21 @@ mod tests {
         let msg3 =
             valid_custodian_msg(Role::indexed_from_one(3), enc_key.clone(), verf_key.clone());
         msg1.header = "wrong header".to_string();
-        let result = validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, true);
-        // The result is ok since we only fail in one message
-        assert!(result.is_ok());
-        assert!(logs_contain("Invalid header in custodian setup message"));
+        let result = validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, true).unwrap();
+        assert_eq!(result.keys.len(), 2);
+        assert!(
+            !result.keys.contains_key(&Role::indexed_from_one(1)),
+            "Role 1 with invalid header should have been filtered"
+        );
+        assert!(
+            result
+                .skip_reasons
+                .contains(&SetupSkipReason::InvalidHeader),
+            "expected InvalidHeader in skip reasons: {:?}",
+            result.skip_reasons
+        );
     }
 
-    #[tracing_test::traced_test]
     #[test]
     fn operator_new_fails_with_invalid_timestamp_past() {
         let mut rng = AesRng::seed_from_u64(6);
@@ -1001,13 +1069,21 @@ mod tests {
             valid_custodian_msg(Role::indexed_from_one(2), enc_key.clone(), verf_key.clone());
         let msg3 =
             valid_custodian_msg(Role::indexed_from_one(3), enc_key.clone(), verf_key.clone());
-        let result = validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, true);
-        // The result is ok since we only fail in one message
-        assert!(result.is_ok());
-        assert!(logs_contain("Invalid timestamp in custodian setup message"));
+        let result = validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, true).unwrap();
+        assert_eq!(result.keys.len(), 2);
+        assert!(
+            !result.keys.contains_key(&Role::indexed_from_one(1)),
+            "Role 1 with past timestamp should have been filtered"
+        );
+        assert!(
+            result
+                .skip_reasons
+                .contains(&SetupSkipReason::InvalidTimestamp),
+            "expected InvalidTimestamp in skip reasons: {:?}",
+            result.skip_reasons
+        );
     }
 
-    #[tracing_test::traced_test]
     #[test]
     fn operator_new_fails_with_invalid_timestamp_future() {
         let mut rng = AesRng::seed_from_u64(6);
@@ -1025,13 +1101,21 @@ mod tests {
             valid_custodian_msg(Role::indexed_from_one(2), enc_key.clone(), verf_key.clone());
         let msg3 =
             valid_custodian_msg(Role::indexed_from_one(3), enc_key.clone(), verf_key.clone());
-        let result = validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, true);
-        // The result is ok since we only fail in one message
-        assert!(result.is_ok());
-        assert!(logs_contain("Invalid timestamp in custodian setup message"));
+        let result = validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, true).unwrap();
+        assert_eq!(result.keys.len(), 2);
+        assert!(
+            !result.keys.contains_key(&Role::indexed_from_one(1)),
+            "Role 1 with future timestamp should have been filtered"
+        );
+        assert!(
+            result
+                .skip_reasons
+                .contains(&SetupSkipReason::InvalidTimestamp),
+            "expected InvalidTimestamp in skip reasons: {:?}",
+            result.skip_reasons
+        );
     }
 
-    #[tracing_test::traced_test]
     #[test]
     fn operator_timestamp_validation() {
         let mut rng = AesRng::seed_from_u64(5);
@@ -1051,16 +1135,15 @@ mod tests {
         let mut msg3 =
             valid_custodian_msg(Role::indexed_from_one(3), enc_key.clone(), verf_key.clone());
         msg3.timestamp = present + 24 * 3600 + 2; // too far in the future by 2 seconds
-        let result = validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, false);
-        // The result is ok since we do not validate the timestamp
-        assert!(result.is_ok());
-        // Check that no logs about timestamp is present
-        assert!(!logs_contain(
-            "Invalid timestamp in custodian setup message"
-        ));
+        let result = validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, false).unwrap();
+        assert_eq!(result.keys.len(), 3);
+        assert!(
+            result.skip_reasons.is_empty(),
+            "no messages should be skipped when timestamp validation is off: {:?}",
+            result.skip_reasons
+        );
     }
 
-    #[tracing_test::traced_test]
     #[test]
     fn operator_new_fails_with_invalid_role() {
         let mut rng = AesRng::seed_from_u64(7);
@@ -1082,19 +1165,16 @@ mod tests {
             enc_key.clone(),
             verf_key.clone(),
         );
-        let result = validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, true);
-        assert!(matches!(result, Err(BackupError::SetupError(_))));
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Not enough valid custodian setup messages"));
-        assert!(logs_contain(
-            "Invalid custodian role in custodian setup message"
-        ));
+        let (received, skipped) = expect_setup_validation_failed(
+            validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, true).unwrap_err(),
+        );
+        assert_eq!(received, 0);
+        assert!(
+            skipped.contains(&SetupSkipReason::InvalidRole),
+            "expected InvalidRole in skip reasons: {skipped:?}"
+        );
     }
 
-    #[tracing_test::traced_test]
     #[test]
     fn operator_new_fails_with_duplicate_roles() {
         let mut rng = AesRng::seed_from_u64(8);
@@ -1107,15 +1187,25 @@ mod tests {
             valid_custodian_msg(Role::indexed_from_one(1), enc_key.clone(), verf_key.clone());
         let msg3 =
             valid_custodian_msg(Role::indexed_from_one(3), enc_key.clone(), verf_key.clone());
-        let result = validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, true);
-        assert!(logs_contain(
-            "Duplicate custodian role in custodian setup message"
-        ));
-        // Things still pass since we have 2 custodians with unique roles
-        assert!(result.is_ok());
+        let result = validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, true).unwrap();
+        assert_eq!(result.keys.len(), 2);
+        assert!(
+            result.keys.contains_key(&Role::indexed_from_one(1)),
+            "Role 1 should be present (first occurrence kept)"
+        );
+        assert!(
+            result.keys.contains_key(&Role::indexed_from_one(3)),
+            "Role 3 should be present"
+        );
+        assert!(
+            result
+                .skip_reasons
+                .contains(&SetupSkipReason::DuplicateRole),
+            "expected DuplicateRole in skip reasons: {:?}",
+            result.skip_reasons
+        );
     }
 
-    #[tracing_test::traced_test]
     #[test]
     fn operator_new_fails_with_not_enough() {
         let mut rng = AesRng::seed_from_u64(8);
@@ -1128,16 +1218,13 @@ mod tests {
             valid_custodian_msg(Role::indexed_from_one(1), enc_key.clone(), verf_key.clone());
         let msg3 =
             valid_custodian_msg(Role::indexed_from_one(1), enc_key.clone(), verf_key.clone());
-        let result = validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, true);
-        assert!(matches!(result, Err(BackupError::SetupError(_))));
-        assert!(logs_contain(
-            "Duplicate custodian role in custodian setup message"
-        ));
-        // Everyone shares the same role
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Not enough valid custodian setup messages"));
+        let (received, skipped) = expect_setup_validation_failed(
+            validate_custodian_messages(vec![msg1, msg2, msg3], 1, 3, true).unwrap_err(),
+        );
+        assert_eq!(received, 1);
+        assert!(
+            skipped.contains(&SetupSkipReason::DuplicateRole),
+            "expected DuplicateRole in skip reasons: {skipped:?}"
+        );
     }
 }

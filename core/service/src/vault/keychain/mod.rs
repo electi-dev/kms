@@ -11,12 +11,12 @@ use aws_sdk_kms::Client as AWSKMSClient;
 use enum_dispatch::enum_dispatch;
 use iam_rs::IAMPolicy;
 use rand::SeedableRng;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{convert::Into, sync::Arc};
 use strum_macros::EnumTryAs;
-use tfhe::{named::Named, Unversionize};
+use tfhe::{Unversionize, named::Named};
 use tfhe_versionable::{Versionize, VersionsDispatch};
-use threshold_fhe::networking::tls::ReleasePCRValues;
+use threshold_networking::tls::ReleasePCRValues;
 
 pub mod awskms;
 pub mod secretsharing;
@@ -71,7 +71,7 @@ pub enum KeychainProxy {
 impl KeychainProxy {
     /// Validate recovery material loaded from public storage, if this is a SecretSharing keychain.
     pub fn validate_recovery_material(&self, verf_key: &PublicSigKey) -> anyhow::Result<()> {
-        if let KeychainProxy::SecretSharing(ref ssk) = self {
+        if let KeychainProxy::SecretSharing(ssk) = self {
             ssk.validate_recovery_material(verf_key)?;
         }
         Ok(())
@@ -213,11 +213,12 @@ pub fn decrypt_under_data_key(
 #[cfg(test)]
 pub mod tests {
     use super::{
+        RootKeyMeasurements,
         awskms::{canonicalize_iam_policy, make_root_key_policy},
-        verify_root_key_measurements, RootKeyMeasurements,
+        verify_root_key_measurements,
     };
     use iam_rs::{IAMPolicy, IAMVersion};
-    use threshold_fhe::networking::tls::ReleasePCRValues;
+    use threshold_networking::tls::ReleasePCRValues;
 
     #[test]
     fn test_verify_root_key_measurements() {

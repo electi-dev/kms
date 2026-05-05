@@ -1,14 +1,15 @@
 use crate::backup::custodian::InternalCustodianRecoveryOutput;
+use crate::backup::error::{BackupError, RecoverySkipReason};
 use crate::backup::operator::DSEP_BACKUP_RECOVERY;
 use crate::consts::DEFAULT_EPOCH_ID;
-use crate::engine::base::{derive_request_id, CrsGenMetadata, KmsFheKeyHandles};
+use crate::engine::base::{CrsGenMetadata, KmsFheKeyHandles, derive_request_id};
 use crate::engine::context::ContextInfo;
 use crate::engine::threshold::service::session::PRSSSetupCombined;
-use crate::engine::utils::{query_key_material_availability, MetricedError};
+use crate::engine::utils::{MetricedError, query_key_material_availability};
 use crate::engine::validation::parse_optional_grpc_request_id;
 use crate::vault::storage::{
-    delete_at_request_and_epoch_id, delete_at_request_id, read_versioned_at_request_id,
-    store_versioned_at_request_and_epoch_id, StorageExt, StorageReaderExt,
+    StorageExt, StorageReaderExt, delete_at_request_and_epoch_id, delete_at_request_id,
+    read_versioned_at_request_id, store_versioned_at_request_and_epoch_id,
 };
 use crate::{
     anyhow_error_and_log,
@@ -27,20 +28,21 @@ use crate::{
         validation::RequestIdParsingErr,
     },
     vault::{
+        Vault,
         keychain::KeychainProxy,
         storage::{
-            crypto_material::CryptoMaterialStorage, store_versioned_at_request_id, Storage,
-            StorageReader,
+            Storage, StorageReader, crypto_material::CryptoMaterialStorage,
+            store_versioned_at_request_id,
         },
-        Vault,
     },
 };
+use algebra::galois_rings::degree_4::{ResiduePolyF4Z64, ResiduePolyF4Z128};
 use itertools::Itertools;
 use kms_grpc::kms::v1::{CustodianRecoveryInitRequest, CustodianRecoveryOutput};
 use kms_grpc::{
+    RequestId,
     kms::v1::{CustodianRecoveryRequest, RecoveryRequest},
     rpc_types::PubDataType,
-    RequestId,
 };
 use kms_grpc::{
     kms::v1::{Empty, KeyMaterialAvailabilityResponse, OperatorPublicKey},
@@ -55,9 +57,8 @@ use std::{
 };
 use strum::IntoEnumIterator;
 use tfhe::safe_serialization::{safe_deserialize, safe_serialize};
-use threshold_fhe::algebra::galois_rings::degree_4::{ResiduePolyF4Z128, ResiduePolyF4Z64};
-use threshold_fhe::execution::runtime::party::Role;
-use threshold_fhe::execution::small_execution::prss::PRSSSetup;
+use threshold_execution::small_execution::prss::PRSSSetup;
+use threshold_types::role::Role;
 use tokio::sync::{Mutex, MutexGuard};
 use tonic::{Request, Response};
 
@@ -148,14 +149,14 @@ where
         RecoveryValidationMaterial,
         HashMap<Role, InternalCustodianRecoveryOutput>,
     )> {
-        let context_id = parse_optional_grpc_request_id(
+        let custodian_context_id = parse_optional_grpc_request_id(
             &req.custodian_context_id,
             RequestIdParsingErr::BackupRecovery,
         )?;
         let recovery_material = {
             load_recovery_validation_material(
                 &self.crypto_storage.get_public_storage(),
-                &context_id,
+                &custodian_context_id,
                 &self.base_kms.verf_key(),
             )
             .await?
@@ -175,13 +176,17 @@ where
             < (recovery_material.custodian_context().threshold as usize) + 1
         {
             return Err(anyhow::anyhow!(
-                        "Only received {} valid recovery outputs, but threshold is {}. Cannot recover the backup decryption key.",
-                        parsed_custodian_rec.len(),
-                        recovery_material.custodian_context().threshold
-                    ));
+                "Only received {} valid recovery outputs, but threshold is {}. Cannot recover the backup decryption key.",
+                parsed_custodian_rec.len(),
+                recovery_material.custodian_context().threshold
+            ));
         }
 
-        Ok((context_id, recovery_material, parsed_custodian_rec))
+        Ok((
+            custodian_context_id,
+            recovery_material,
+            parsed_custodian_rec,
+        ))
     }
 }
 
@@ -255,7 +260,9 @@ where
         if guarded_priv_key.is_some() {
             match inner.overwrite_ephemeral_key {
                 true => {
-                    tracing::warn!("Ephemeral decryption key already exists. OVERWRITING the old ephemeral key, thus invalidating any previous recovery initialization!");
+                    tracing::warn!(
+                        "Ephemeral decryption key already exists. OVERWRITING the old ephemeral key, thus invalidating any previous recovery initialization!"
+                    );
                 }
                 false => {
                     return Err(MetricedError::new(
@@ -368,7 +375,11 @@ where
                 match backup_vault.keychain {
                     Some(KeychainProxy::SecretSharing(ref mut keychain)) => {
                         // Amount of custodians get defined during context creation
-                        let amount_custodians = recovery_material.payload.custodian_context.custodian_nodes.len();
+                        let amount_custodians = recovery_material
+                            .payload
+                            .custodian_context
+                            .custodian_nodes
+                            .len();
                         let operator = Operator::new_for_validating(
                             recovery_material.custodian_context().custodian_nodes.values().cloned().collect_vec(),
                             (*self.base_kms.verf_key()).clone(),
@@ -382,16 +393,31 @@ where
                                 tonic::Code::Internal,
                             )
                         })?;
-                        let custodian_outputs: Vec<InternalCustodianRecoveryOutput> = parsed_custodian_rec.values().cloned().collect();
-                        let serialized_dec_key = operator.verify_and_recover(&custodian_outputs, &recovery_material, context_id, &ephemeral_dec_key, &ephemeral_enc_key).map_err(|e| {
-                            MetricedError::new(
-                                OP_CUSTODIAN_BACKUP_RECOVERY,
-                                None,
-                                anyhow::anyhow!("Failed to verify the backup decryption request: {e}"),
-                                tonic::Code::Unauthenticated,
+                        let custodian_outputs: Vec<InternalCustodianRecoveryOutput> =
+                            parsed_custodian_rec.values().cloned().collect();
+                        let serialized_dec_key = operator
+                            .verify_and_recover(
+                                &custodian_outputs,
+                                &recovery_material,
+                                context_id,
+                                &ephemeral_dec_key,
+                                &ephemeral_enc_key,
                             )
-                        })?;
-                        let backup_dec_key: UnifiedPrivateEncKey = safe_deserialize(std::io::Cursor::new(&serialized_dec_key), SAFE_SER_SIZE_LIMIT).map_err(|e| {
+                            .map_err(|e| {
+                                MetricedError::new(
+                                    OP_CUSTODIAN_BACKUP_RECOVERY,
+                                    None,
+                                    anyhow::anyhow!(
+                                        "Failed to verify the backup decryption request: {e}"
+                                    ),
+                                    tonic::Code::Unauthenticated,
+                                )
+                            })?;
+                        let backup_dec_key: UnifiedPrivateEncKey = safe_deserialize(
+                            std::io::Cursor::new(&serialized_dec_key),
+                            SAFE_SER_SIZE_LIMIT,
+                        )
+                        .map_err(|e| {
                             MetricedError::new(
                                 OP_CUSTODIAN_BACKUP_RECOVERY,
                                 None,
@@ -402,11 +428,12 @@ where
                         keychain.set_dec_key(Some(backup_dec_key));
                         Ok(Response::new(Empty {}))
                     }
-                    _ => Err(
-                        MetricedError::new(
+                    _ => Err(MetricedError::new(
                         OP_CUSTODIAN_BACKUP_RECOVERY,
                         None,
-                        anyhow::anyhow!("Backup vault is not setup with a keychain for custodian-based backup recovery"),
+                        anyhow::anyhow!(
+                            "Backup vault is not setup with a keychain for custodian-based backup recovery"
+                        ),
                         tonic::Code::Unavailable,
                     )),
                 }
@@ -494,17 +521,20 @@ where
 /// Load and validate the recovery validation material associated with the provided context ID
 async fn load_recovery_validation_material<S>(
     public_storage: &Mutex<S>,
-    context_id: &RequestId,
-    verf_key: &PublicSigKey,
+    custodian_context_id: &RequestId,
+    verf_key: &Arc<PublicSigKey>,
 ) -> anyhow::Result<RecoveryValidationMaterial>
 where
     S: StorageReader + Send,
 {
     let public_storage_guard = public_storage.lock().await;
     let recovery_material: RecoveryValidationMaterial = public_storage_guard
-        .read_data(context_id, &PubDataType::RecoveryMaterial.to_string())
+        .read_data(
+            custodian_context_id,
+            &PubDataType::RecoveryMaterial.to_string(),
+        )
         .await?;
-    if &recovery_material.custodian_context().context_id != context_id {
+    if &recovery_material.custodian_context().context_id != custodian_context_id {
         anyhow::bail!("The custodian context associated with the provided context ID is invalid",);
     }
     if !recovery_material.validate(verf_key) {
@@ -523,24 +553,27 @@ async fn filter_custodian_data(
     ephemeral_enc_key: &UnifiedPublicEncKey,
 ) -> anyhow::Result<HashMap<Role, InternalCustodianRecoveryOutput>> {
     let mut parsed_custodian_rec: HashMap<Role, InternalCustodianRecoveryOutput> = HashMap::new();
+    let mut skip_reasons: Vec<RecoverySkipReason> = Vec::new();
     for cur_recovery_output in &custodian_recovery_outputs {
         let current_verf_key: PublicSigKey =
             bc2wrap::deserialize_safe(&cur_recovery_output.operator_verification_key)?;
         if current_verf_key != *my_verf_key {
             tracing::warn!(
-                    "Received recovery output for operator {}, but current server is {}. The output will be ignored.",
-                    current_verf_key.address(),
-                    my_verf_key.address(),
-                );
+                "Received recovery output for operator {}, but current server is {}. The output will be ignored.",
+                current_verf_key.address(),
+                my_verf_key.address(),
+            );
+            skip_reasons.push(RecoverySkipReason::WrongOperator);
             continue;
         }
         if cur_recovery_output.custodian_role == 0
             || cur_recovery_output.custodian_role > custodian_recovery_outputs.len() as u64
         {
             tracing::warn!(
-                    "Received recovery output with invalid custodian role {}. The output will be ignored.",
-                    cur_recovery_output.custodian_role,
-                );
+                "Received recovery output with invalid custodian role {}. The output will be ignored.",
+                cur_recovery_output.custodian_role,
+            );
+            skip_reasons.push(RecoverySkipReason::InvalidRole);
             continue;
         }
         let cur_verf = match recovery_material.custodian_context().custodian_nodes.get(
@@ -552,6 +585,7 @@ async fn filter_custodian_data(
                     "Could not find verification key for custodian role {}",
                     cur_recovery_output.custodian_role
                 );
+                skip_reasons.push(RecoverySkipReason::MissingVerificationKey);
                 continue;
             }
         };
@@ -570,6 +604,7 @@ async fn filter_custodian_data(
                     "Could not find signcryption for custodian role {}",
                     cur_recovery_output.custodian_role
                 );
+                skip_reasons.push(RecoverySkipReason::MissingSigncryption);
                 continue;
             }
         };
@@ -581,40 +616,51 @@ async fn filter_custodian_data(
                 "Could not validate signcryption for custodian role {}",
                 cur_recovery_output.custodian_role
             );
+            skip_reasons.push(RecoverySkipReason::InvalidSigncryption);
             continue;
         }
         match <InternalCustodianRecoveryOutput as TryFrom<_>>::try_from(
             cur_recovery_output.to_owned(),
         ) {
-            Ok(output) => {
-                match parsed_custodian_rec.entry(output.custodian_role) {
-                    std::collections::hash_map::Entry::Occupied(_) => {
-                        /* do nothing if occupied */
-                        tracing::warn!(
-                                    "Received multiple recovery outputs for custodian {}. Only the first one will be used.",
-                                    current_verf_key.address(),
-                                );
-                    }
-                    std::collections::hash_map::Entry::Vacant(vacant_entry) => {
-                        vacant_entry.insert(output);
-                    }
+            Ok(output) => match parsed_custodian_rec.entry(output.custodian_role) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    tracing::warn!(
+                        "Received multiple recovery outputs for custodian {}. Only the first one will be used.",
+                        current_verf_key.address(),
+                    );
+                    skip_reasons.push(RecoverySkipReason::DuplicateRole);
                 }
-            }
+                std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                    vacant_entry.insert(output);
+                }
+            },
             Err(e) => {
                 tracing::warn!(
-                            "Failed to parse custodian recovery output for operator role {}: {e}. The output will be ignored.",
-                                current_verf_key.address(),
-                        );
+                    "Failed to parse custodian recovery output for operator role {}: {e}. The output will be ignored.",
+                    current_verf_key.address(),
+                );
+                skip_reasons.push(RecoverySkipReason::ParseError);
                 continue;
             }
         }
     }
-    if parsed_custodian_rec.len() < 1 + recovery_material.custodian_context().threshold as usize {
-        return Err(anyhow_error_and_log(format!(
-                "Only received {} valid recovery outputs, but threshold is {}. Cannot recover the backup decryption key.",
-                parsed_custodian_rec.len(),
-                recovery_material.custodian_context().threshold)
-            ));
+    let threshold = recovery_material.custodian_context().threshold as usize;
+    let required_min = threshold + 1;
+    if parsed_custodian_rec.len() < required_min {
+        let received = parsed_custodian_rec.len();
+        tracing::error!(
+            received,
+            threshold,
+            ?skip_reasons,
+            "Cannot recover the backup decryption key: not enough valid recovery outputs"
+        );
+        return Err(BackupError::RecoveryThresholdNotMet {
+            required_min,
+            received,
+            threshold,
+            skipped: skip_reasons,
+        }
+        .into());
     }
     Ok(parsed_custodian_rec)
 }
@@ -722,9 +768,9 @@ where
                 .await?
             {
                 tracing::warn!(
-                "Data for {:?} with request ID {request_id} already exists. I am NOT overwriting it!",
-                data_type_enum
-            );
+                    "Data for {:?} with request ID {request_id} already exists. I am NOT overwriting it!",
+                    data_type_enum
+                );
                 continue;
             }
             let cur_data: T = backup_vault
@@ -826,7 +872,9 @@ where
         && data_type_enum != PrivDataType::FhePrivateKey
         && data_type_enum != PrivDataType::CrsInfo
     {
-        anyhow::bail!("This method is only meant to be used for epoched material, but the provided data type is not epoched.");
+        anyhow::bail!(
+            "This method is only meant to be used for epoched material, but the provided data type is not epoched."
+        );
     }
     let epoch_ids = priv_storage
         .all_epoch_ids_for_data(&data_type_enum.to_string())
@@ -897,7 +945,9 @@ where
     for<'a> <T as tfhe::Versionize>::Versioned<'a>: Send + Sync,
 {
     if data_type_enum == PrivDataType::FheKeyInfo || data_type_enum == PrivDataType::FhePrivateKey {
-        anyhow::bail!("This method is only meant to be used for non-epoched material, but the provided data type is epoched.");
+        anyhow::bail!(
+            "This method is only meant to be used for non-epoched material, but the provided data type is epoched."
+        );
     }
     let req_ids = priv_storage
         .all_data_ids(&data_type_enum.to_string())
@@ -931,99 +981,6 @@ where
         .await?;
     }
     Ok(())
-}
-
-impl<PubS, PrivS> RealBackupOperator<PubS, PrivS>
-where
-    PubS: Storage + Sync + Send + 'static,
-    PrivS: StorageExt + Sync + Send + 'static,
-{
-    pub async fn update_backup_vault(&self, overwrite: bool) -> anyhow::Result<()> {
-        match self.crypto_storage.backup_vault {
-            Some(ref backup_vault) => {
-                let private_storage = self.crypto_storage.get_private_storage().clone();
-                let private_storage = private_storage.lock().await;
-                let mut backup_vault: tokio::sync::MutexGuard<'_, Vault> =
-                    backup_vault.lock().await;
-                if !keychain_initialized(&backup_vault).await {
-                    tracing::warn!("Secret sharing keychain in the backup vault has not been initialized yet. Skipping backup update.");
-                    return Ok(());
-                }
-                for cur_type in PrivDataType::iter() {
-                    match cur_type {
-                        // These types might have epoch-specific data
-                        PrivDataType::FheKeyInfo => {
-                            update_specific_backup_vault_for_all_epochs::<PrivS, ThresholdFheKeys>(
-                                &private_storage,
-                                &mut backup_vault,
-                                cur_type,
-                                overwrite,
-                            )
-                            .await?;
-                        }
-                        PrivDataType::FhePrivateKey => {
-                            update_specific_backup_vault_for_all_epochs::<PrivS, KmsFheKeyHandles>(
-                                &private_storage,
-                                &mut backup_vault,
-                                cur_type,
-                                overwrite,
-                            )
-                            .await?;
-                        }
-                        // Non epoched types
-                        PrivDataType::PrssSetupCombined => {
-                            update_specific_backup_vault::<PrivS, PRSSSetupCombined>(
-                                &private_storage,
-                                &mut backup_vault,
-                                cur_type,
-                                overwrite,
-                            )
-                            .await?;
-                        }
-                        #[expect(deprecated)]
-                        PrivDataType::PrssSetup => {
-                            update_legacy_prss_13_4::<PrivS>(
-                                &private_storage,
-                                &mut backup_vault,
-                                overwrite,
-                            )
-                            .await?;
-                        }
-                        PrivDataType::SigningKey => {
-                            // TODO(#2862) will eventually be epoched
-                            update_specific_backup_vault::<PrivS, PrivateSigKey>(
-                                &private_storage,
-                                &mut backup_vault,
-                                cur_type,
-                                overwrite,
-                            )
-                            .await?;
-                        }
-                        PrivDataType::CrsInfo => {
-                            update_specific_backup_vault_for_all_epochs::<PrivS, CrsGenMetadata>(
-                                &private_storage,
-                                &mut backup_vault,
-                                cur_type,
-                                overwrite,
-                            )
-                            .await?;
-                        }
-                        PrivDataType::ContextInfo => {
-                            update_specific_backup_vault::<PrivS, ContextInfo>(
-                                &private_storage,
-                                &mut backup_vault,
-                                cur_type,
-                                overwrite,
-                            )
-                            .await?;
-                        }
-                    }
-                }
-                Ok(())
-            }
-            None => Ok(()),
-        }
-    }
 }
 
 // *WARNING* this function only works with n=13, t=4
@@ -1098,7 +1055,9 @@ pub(crate) async fn update_legacy_prss_13_4<PrivS: Storage + Sync + Send + 'stat
             );
         }
         (Err(e1), Err(e2)) => {
-            tracing::warn!("Neither Legacy PRSS Z128 nor Z64 are available, cannot update PRSS backup data: Z128 error: {e1}, Z64 error: {e2}");
+            tracing::warn!(
+                "Neither Legacy PRSS Z128 nor Z64 are available, cannot update PRSS backup data: Z128 error: {e1}, Z64 error: {e2}"
+            );
         }
     }
     Ok(())
@@ -1151,13 +1110,17 @@ async fn restore_legacy_prss_13_4<PrivS: Storage + Sync + Send + 'static>(
             );
         }
         (Err(e1), Err(e2)) => {
-            tracing::warn!("Neither Legacy PRSS Z128 nor Z64 are available, cannot update PRSS backup data: Z128 error: {e1}, Z64 error: {e2}");
+            tracing::warn!(
+                "Neither Legacy PRSS Z128 nor Z64 are available, cannot update PRSS backup data: Z128 error: {e1}, Z64 error: {e2}"
+            );
         }
     }
     Ok(())
 }
 
-async fn keychain_initialized(backup_vault_guard: &tokio::sync::MutexGuard<'_, Vault>) -> bool {
+pub(crate) async fn keychain_initialized(
+    backup_vault_guard: &tokio::sync::MutexGuard<'_, Vault>,
+) -> bool {
     if let Some(KeychainProxy::SecretSharing(ssk)) = &backup_vault_guard.keychain {
         // If the backup key is not there, then it is not initialized
         if ssk.get_backup_enc_key().is_err() {
@@ -1170,11 +1133,13 @@ async fn keychain_initialized(backup_vault_guard: &tokio::sync::MutexGuard<'_, V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::storage::{ram::RamStorage, tests::TestType, StorageProxy};
+    use crate::backup::error::{BackupError, RecoverySkipReason};
+    use crate::consts::DEFAULT_MPC_CONTEXT;
+    use crate::vault::storage::{StorageProxy, ram::RamStorage, tests::TestType};
     use crate::{
-        backup::custodian::{CustodianSetupMessagePayload, InternalCustodianContext, HEADER},
+        backup::custodian::{CustodianSetupMessagePayload, HEADER, InternalCustodianContext},
         cryptography::{
-            signatures::{gen_sig_keys, SigningSchemeType},
+            signatures::{SigningSchemeType, gen_sig_keys},
             signcryption::UnifiedSigncryption,
         },
         engine::base::derive_request_id,
@@ -1242,7 +1207,7 @@ mod tests {
         };
         let custodian_context = CustodianContext {
             custodian_nodes: vec![setup_msg1, setup_msg2, setup_msg3],
-            context_id: Some(backup_id.into()),
+            custodian_context_id: Some(backup_id.into()),
             threshold,
         };
         let internal_custodian_context =
@@ -1258,9 +1223,14 @@ mod tests {
         cts.insert(Role::indexed_from_one(1), cts_out.clone());
         cts.insert(Role::indexed_from_one(2), cts_out.clone());
         cts.insert(Role::indexed_from_one(3), cts_out.clone());
-        let rec_material =
-            RecoveryValidationMaterial::new(cts, commitments, internal_custodian_context, &sig_key)
-                .unwrap();
+        let rec_material = RecoveryValidationMaterial::new(
+            cts,
+            commitments,
+            internal_custodian_context,
+            &sig_key,
+            *DEFAULT_MPC_CONTEXT,
+        )
+        .unwrap();
         (rec_material, verf_key, dec_key, enc_key)
     }
 
@@ -1278,10 +1248,24 @@ mod tests {
                 pke_type: 0,
                 signing_type: 0,
             }),
+            mpc_context_id: Some(kms_grpc::RequestId::from_bytes([7u8; 32]).into()),
         }
     }
 
-    #[tracing_test::traced_test]
+    fn expect_threshold_not_met(err: anyhow::Error) -> (usize, Vec<RecoverySkipReason>) {
+        let backup_err = err
+            .downcast_ref::<BackupError>()
+            .expect("expected BackupError");
+        if let BackupError::RecoveryThresholdNotMet {
+            received, skipped, ..
+        } = backup_err
+        {
+            (*received, skipped.clone())
+        } else {
+            panic!("expected RecoveryThresholdNotMet, got: {backup_err}");
+        }
+    }
+
     #[tokio::test]
     async fn test_filter_custodian_missing_cus_output() {
         let (recovery_material, verf_key, dec_key, enc_key) = dummy_recovery_material(1);
@@ -1290,17 +1274,19 @@ mod tests {
             custodian_role: 2,
             operator_verification_key: bc2wrap::serialize(&verf_key).unwrap(),
             backup_output: None, // Missing backup output for custodian role 2
+            mpc_context_id: Some(kms_grpc::RequestId::from_bytes([7u8; 32]).into()),
         };
         outputs.push(cus_2);
         let result =
             filter_custodian_data(outputs, &recovery_material, &verf_key, &dec_key, &enc_key).await;
-        assert!(logs_contain(
-            "Could not find signcryption for custodian role"
-        ));
-        assert!(result.is_err());
+        let (received, skipped) = expect_threshold_not_met(result.unwrap_err());
+        assert_eq!(received, 0);
+        assert!(
+            skipped.contains(&RecoverySkipReason::MissingSigncryption),
+            "expected MissingSigncryption in skip reasons: {skipped:?}"
+        );
     }
 
-    #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_filter_custodian_data_invalid_operator_role() {
         let (recovery_material, verf_key, dec_key, enc_key) = dummy_recovery_material(1);
@@ -1314,11 +1300,14 @@ mod tests {
             &enc_key,
         )
         .await;
-        assert!(result.is_err());
-        assert!(logs_contain("Cannot recover the backup decryption key"));
+        let (received, skipped) = expect_threshold_not_met(result.unwrap_err());
+        assert_eq!(received, 0);
+        assert!(
+            skipped.contains(&RecoverySkipReason::WrongOperator),
+            "expected WrongOperator in skip reasons: {skipped:?}"
+        );
     }
 
-    #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_filter_custodian_data_invalid_custodian_role() {
         let (recovery_material, verf_key, dec_key, enc_key) = dummy_recovery_material(1);
@@ -1328,16 +1317,16 @@ mod tests {
         ];
         let result =
             filter_custodian_data(outputs, &recovery_material, &verf_key, &dec_key, &enc_key).await;
-        assert!(result.is_err());
-        assert!(logs_contain(
-            "Received recovery output with invalid custodian role"
-        ));
+        let (received, skipped) = expect_threshold_not_met(result.unwrap_err());
+        assert_eq!(received, 0);
+        assert!(
+            skipped.contains(&RecoverySkipReason::InvalidRole),
+            "expected InvalidRole in skip reasons: {skipped:?}"
+        );
     }
 
-    #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_filter_custodian_data_invalid_signature() {
-        // Note there is no node information in the dummy material
         let (recovery_material, verf_key, dec_key, enc_key) = dummy_recovery_material(1);
         let outputs = vec![
             dummy_output_for_operator(1, verf_key.clone()),
@@ -1346,20 +1335,16 @@ mod tests {
         ];
         let result =
             filter_custodian_data(outputs, &recovery_material, &verf_key, &dec_key, &enc_key).await;
-        assert!(result.is_err());
-        assert!(logs_contain(
-            "Could not validate signcryption for custodian"
-        ));
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Only received 0 valid recovery outputs")); // Signatures are wrong so no valid outputs
+        let (received, skipped) = expect_threshold_not_met(result.unwrap_err());
+        assert_eq!(received, 0);
+        assert!(
+            skipped.contains(&RecoverySkipReason::InvalidSigncryption),
+            "expected InvalidSigncryption in skip reasons: {skipped:?}"
+        );
     }
 
-    #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_filter_custodian_data_missing_verification_key() {
-        // Note there is no node information in the dummy material
         let (mut recovery_material, verf_key, dec_key, enc_key) = dummy_recovery_material(1);
         recovery_material
             .payload
@@ -1372,10 +1357,12 @@ mod tests {
         ];
         let result =
             filter_custodian_data(outputs, &recovery_material, &verf_key, &dec_key, &enc_key).await;
-        assert!(result.is_err());
-        assert!(logs_contain(
-            "Could not find verification key for custodian role"
-        ));
+        let (received, skipped) = expect_threshold_not_met(result.unwrap_err());
+        assert_eq!(received, 0);
+        assert!(
+            skipped.contains(&RecoverySkipReason::MissingVerificationKey),
+            "expected MissingVerificationKey in skip reasons: {skipped:?}"
+        );
     }
     #[tokio::test]
     async fn test_update_backup_vault() {

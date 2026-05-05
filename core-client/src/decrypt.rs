@@ -1,12 +1,11 @@
-use crate::{dummy_domain, dummy_handle, print_timings, CoreConf, SLEEP_TIME_BETWEEN_REQUESTS_MS};
+use crate::{CoreConf, SLEEP_TIME_BETWEEN_REQUESTS_MS, dummy_domain, dummy_handle, print_timings};
 use alloy_sol_types::Eip712Domain;
 use kms_grpc::{
+    ContextId, EpochId, KeyId, RequestId,
     kms::v1::{PublicDecryptionRequest, PublicDecryptionResponse, TypedCiphertext, TypedPlaintext},
     kms_service::v1::core_service_endpoint_client::CoreServiceEndpointClient,
     rpc_types::protobuf_to_alloy_domain,
-    ContextId, EpochId, KeyId, RequestId,
 };
-use kms_lib::cryptography::encryption::PkeSchemeType;
 use kms_lib::{
     client::{client_wasm::Client, user_decryption_wasm::ParsedUserDecryptionRequest},
     cryptography::signatures::recover_address_from_ext_signature,
@@ -22,8 +21,8 @@ use tonic::transport::Channel;
 /// check that the external signature on the decryption result(s) is valid, i.e. was made by one of the supplied addresses
 fn check_ext_pt_signature(
     external_sig: &[u8],
-    plaintexts: &Vec<TypedPlaintext>,
-    external_handles: Vec<Vec<u8>>,
+    plaintexts: &[TypedPlaintext],
+    external_handles: &[Vec<u8>],
     domain: Eip712Domain,
     kms_addrs: &[alloy_primitives::Address],
     extra_data: &[u8],
@@ -65,7 +64,7 @@ fn check_external_decryption_signature(
         check_ext_pt_signature(
             &response.external_signature,
             &payload.plaintexts,
-            external_handles.to_owned(),
+            external_handles,
             domain.clone(),
             kms_addrs,
             extra_data,
@@ -158,7 +157,7 @@ pub(crate) async fn do_public_decrypt<R: Rng + CryptoRng>(
             // make parallel requests by calling [decrypt] in a thread
             let mut req_tasks = JoinSet::new();
 
-            for (_party_id, ce) in core_endpoints_req.iter() {
+            for ce in core_endpoints_req.values() {
                 let req_cloned = dec_req.clone();
                 let mut cur_client = ce.clone();
                 req_tasks.spawn(async move {
@@ -286,7 +285,6 @@ pub(crate) async fn do_user_decrypt<R: Rng + CryptoRng>(
                 &key_id.into(),
                 context_id.as_ref(),
                 epoch_id.as_ref(),
-                PkeSchemeType::MlKem512,
                 &extra_data,
             )?;
 
@@ -422,9 +420,10 @@ pub(crate) async fn do_user_decrypt<R: Rng + CryptoRng>(
                 .process_user_decryption_resp(
                     &client_request,
                     &eip712_domain,
-                    &resp_response_vec,
                     &enc_pk,
                     &enc_sk,
+                    None,
+                    &resp_response_vec,
                 )
                 .inspect_err(|e| {
                     tracing::error!(
@@ -634,8 +633,8 @@ pub(crate) async fn get_public_decrypt_responses(
     // check the internal signatures
     internal_client.process_decryption_resp(
         dec_req,
-        &resp_response_vec,
         num_expected_responses as u32,
+        &resp_response_vec,
     )?;
 
     // check the external signatures

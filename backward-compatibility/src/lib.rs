@@ -297,6 +297,51 @@ impl TestType for CrsGenMetadataTest {
     }
 }
 
+// KMS test — same shape as `KeyGenMetadataTest` but for version 13.20 with extra data.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct KeyGenMetadataWithExtraDataTest {
+    pub test_filename: Cow<'static, str>,
+    pub state: u64,
+    pub extra_data: Cow<'static, [u8]>,
+}
+
+impl TestType for KeyGenMetadataWithExtraDataTest {
+    fn module(&self) -> String {
+        KMS_MODULE_NAME.to_string()
+    }
+
+    fn target_type(&self) -> String {
+        "KeyGenMetadataWithExtraData".to_string()
+    }
+
+    fn test_filename(&self) -> String {
+        self.test_filename.to_string()
+    }
+}
+
+// KMS test — same shape as `CrsGenMetadataTest` but for version 13.20 with extra data.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CrsGenMetadataWithExtraDataTest {
+    pub test_filename: Cow<'static, str>,
+    pub state: u64,
+    pub max_num_bits: u32,
+    pub extra_data: Cow<'static, [u8]>,
+}
+
+impl TestType for CrsGenMetadataWithExtraDataTest {
+    fn module(&self) -> String {
+        KMS_MODULE_NAME.to_string()
+    }
+
+    fn target_type(&self) -> String {
+        "CrsGenMetadataWithExtraData".to_string()
+    }
+
+    fn test_filename(&self) -> String {
+        self.test_filename.to_string()
+    }
+}
+
 // KMS test
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppKeyBlobTest {
@@ -775,6 +820,7 @@ pub struct RecoveryValidationMaterialTest {
     pub internal_cus_context_filename: Cow<'static, str>,
     pub state: u64,
     pub custodian_count: usize,
+    pub mpc_context_id: [u8; 32],
 }
 
 impl TestType for RecoveryValidationMaterialTest {
@@ -842,6 +888,7 @@ impl TestType for InternalCustodianContextTest {
 pub struct InternalCustodianRecoveryOutputTest {
     pub test_filename: Cow<'static, str>,
     pub state: u64,
+    pub mpc_context_id: [u8; 32],
 }
 
 impl TestType for InternalCustodianRecoveryOutputTest {
@@ -890,6 +937,8 @@ pub enum TestMetadataKMS {
     AppKeyBlob(AppKeyBlobTest),
     CrsGenMetadata(CrsGenMetadataTest),
     KeyGenMetadata(KeyGenMetadataTest),
+    CrsGenMetadataWithExtraData(CrsGenMetadataWithExtraDataTest),
+    KeyGenMetadataWithExtraData(KeyGenMetadataWithExtraDataTest),
     SigncryptionPayload(SigncryptionPayloadTest),
     PrssSetupCombined(PrssSetupCombinedTest),
     UnifiedSigncryptionKeyOwned(UnifiedSigncryptionKeyTest),

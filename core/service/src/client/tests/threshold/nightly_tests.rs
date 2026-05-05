@@ -8,9 +8,9 @@ use crate::consts::DEFAULT_THRESHOLD_KEY_ID;
 use crate::consts::{DEFAULT_AMOUNT_PARTIES, DEFAULT_PARAM};
 use crate::util::key_setup::test_tools::EncryptionConfig;
 use crate::util::key_setup::test_tools::TestingPlaintext;
-use kms_grpc::{kms::v1::FheParameter, RequestId};
+use kms_grpc::{RequestId, kms::v1::FheParameter};
 use serial_test::serial;
-use threshold_fhe::execution::runtime::party::Role;
+use threshold_types::role::Role;
 
 #[rstest::rstest]
 #[case(vec![TestingPlaintext::Bool(true)], 2, DEFAULT_AMOUNT_PARTIES, &DEFAULT_THRESHOLD_KEY_ID)]
@@ -23,7 +23,7 @@ use threshold_fhe::execution::runtime::party::Role;
 #[case(vec![TestingPlaintext::U256(tfhe::integer::U256::from((u128::MAX, u128::MAX)))], 1, DEFAULT_AMOUNT_PARTIES, &DEFAULT_THRESHOLD_KEY_ID)]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-#[tracing_test::traced_test]
+
 async fn default_decryption_threshold_with_sns_preprocessing(
     #[case] msg: Vec<TestingPlaintext>,
     #[case] parallelism: usize,
@@ -94,7 +94,7 @@ async fn default_decryption_threshold_with_crash(
 #[case(TestingPlaintext::U160(tfhe::integer::U256::from((u128::MAX, u32::MAX as u128))), 1, DEFAULT_AMOUNT_PARTIES, &DEFAULT_THRESHOLD_KEY_ID)]
 #[case(TestingPlaintext::U256(tfhe::integer::U256::from((u128::MAX, u128::MAX))), 1, DEFAULT_AMOUNT_PARTIES, &DEFAULT_THRESHOLD_KEY_ID)]
 #[serial]
-#[tracing_test::traced_test]
+
 async fn default_user_decryption_threshold(
     #[case] msg: TestingPlaintext,
     #[case] parallelism: usize,
@@ -105,7 +105,6 @@ async fn default_user_decryption_threshold(
     user_decryption_threshold(
         DEFAULT_PARAM,
         key_id,
-        false,
         false,
         msg,
         EncryptionConfig {
@@ -135,7 +134,7 @@ async fn default_user_decryption_threshold(
 #[case(TestingPlaintext::U160(tfhe::integer::U256::from((u128::MAX, u32::MAX as u128))), 1, DEFAULT_AMOUNT_PARTIES, &DEFAULT_THRESHOLD_KEY_ID)]
 #[case(TestingPlaintext::U256(tfhe::integer::U256::from((u128::MAX, u128::MAX))), 1, DEFAULT_AMOUNT_PARTIES, &DEFAULT_THRESHOLD_KEY_ID)]
 #[serial]
-#[tracing_test::traced_test]
+
 async fn default_user_decryption_threshold_sns_precompute(
     #[case] msg: TestingPlaintext,
     #[case] parallelism: usize,
@@ -147,7 +146,6 @@ async fn default_user_decryption_threshold_sns_precompute(
     user_decryption_threshold(
         DEFAULT_PARAM,
         key_id,
-        false,
         false,
         msg,
         EncryptionConfig {
@@ -191,7 +189,6 @@ async fn default_user_decryption_threshold_with_crash(
         DEFAULT_PARAM,
         key_id,
         false,
-        false,
         msg,
         EncryptionConfig {
             compression: true,
@@ -214,7 +211,6 @@ async fn default_user_decryption_threshold_with_crash(
 
 #[tokio::test(flavor = "multi_thread")]
 #[rstest::rstest]
-#[tracing_test::traced_test]
 #[case(4)]
 #[case(DEFAULT_AMOUNT_PARTIES)]
 #[serial]
@@ -233,7 +229,6 @@ async fn secure_threshold_sequential_crs_test(#[case] amount_parties: usize) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
 #[rstest::rstest]
 #[case(4)]
 #[case(DEFAULT_AMOUNT_PARTIES)]
@@ -269,7 +264,6 @@ async fn secure_threshold_sequential_crs_default(#[case] amount_parties: usize) 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
 #[rstest::rstest]
 #[case(4)]
 #[case(DEFAULT_AMOUNT_PARTIES)]
@@ -329,7 +323,6 @@ async fn secure_threshold_keygen_with_partial_preproc(#[case] amount_parties: us
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
 #[rstest::rstest]
 #[case(4)]
 #[case(DEFAULT_AMOUNT_PARTIES)]
@@ -350,7 +343,6 @@ async fn secure_threshold_concurrent_keygen_test(#[case] amount_parties: usize) 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
 #[rstest::rstest]
 #[case(4)]
 #[case(DEFAULT_AMOUNT_PARTIES)]
@@ -372,7 +364,6 @@ async fn secure_threshold_concurrent_compressed_keygen_test(#[case] amount_parti
 
 #[cfg(feature = "slow_tests")]
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
 #[rstest::rstest]
 #[case(4)]
 #[case(DEFAULT_AMOUNT_PARTIES)]

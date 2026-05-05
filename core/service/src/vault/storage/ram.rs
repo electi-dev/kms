@@ -1,15 +1,15 @@
-use super::{Storage, StorageReader};
+use super::{Storage, StorageReader, StoreWriteOutcome};
 use crate::consts::SAFE_SER_SIZE_LIMIT;
-use crate::vault::storage::{all_data_ids_from_all_epochs_impl, StorageExt};
+use crate::vault::storage::{StorageExt, all_data_ids_from_all_epochs_impl};
 use crate::{anyhow_error_and_log, vault::storage::StorageReaderExt};
 use anyhow::anyhow;
-use kms_grpc::{identifiers::EpochId, RequestId};
-use serde::{de::DeserializeOwned, Serialize};
+use kms_grpc::{RequestId, identifiers::EpochId};
+use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
 use tfhe::{
+    Unversionize, Versionize,
     named::Named,
     safe_serialization::{safe_deserialize, safe_serialize},
-    Unversionize, Versionize,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -50,7 +50,7 @@ impl StorageReader for RamStorage {
                     "Could not find data at (data_type: {}, data_id: {})",
                     data_type,
                     data_id
-                ))
+                ));
             }
         };
         let mut buf = std::io::Cursor::new(raw_data);
@@ -68,7 +68,7 @@ impl StorageReader for RamStorage {
                     "Could not decode data at ({}, {})",
                     data_id,
                     data_type
-                ))
+                ));
             }
         };
         Ok(raw_data.clone())
@@ -108,7 +108,7 @@ impl StorageReaderExt for RamStorage {
                     data_type,
                     data_id,
                     epoch_id
-                ))
+                ));
             }
         };
         let mut buf = std::io::Cursor::new(raw_data);
@@ -118,10 +118,10 @@ impl StorageReaderExt for RamStorage {
     async fn all_epoch_ids_for_data(&self, data_type: &str) -> anyhow::Result<HashSet<EpochId>> {
         let mut res = HashSet::new();
         for ((_cur_data_id, cur_epoch_id), cur_data_type) in self.internal_storage.keys() {
-            if let Some(epoch_id) = cur_epoch_id {
-                if cur_data_type == data_type {
-                    res.insert(*epoch_id);
-                }
+            if let Some(epoch_id) = cur_epoch_id
+                && cur_data_type == data_type
+            {
+                res.insert(*epoch_id);
             }
         }
         Ok(res)
@@ -156,7 +156,9 @@ impl StorageReaderExt for RamStorage {
         &self,
         data_type: &str,
     ) -> anyhow::Result<HashSet<RequestId>> {
-        all_data_ids_from_all_epochs_impl(self, data_type).await
+        all_data_ids_from_all_epochs_impl(self, data_type)
+            .await
+            .map(|(ids, _)| ids)
     }
 
     async fn load_bytes_at_epoch(
@@ -176,7 +178,7 @@ impl StorageReaderExt for RamStorage {
                     data_id,
                     epoch_id,
                     data_type
-                ))
+                ));
             }
         };
         Ok(raw_data.clone())
@@ -189,20 +191,20 @@ impl Storage for RamStorage {
         data: &T,
         data_id: &RequestId,
         data_type: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<StoreWriteOutcome> {
         if self.data_exists(data_id, data_type).await? {
             tracing::warn!(
                 "The data {}-{} already exists. Keeping the data without overwriting",
                 data_id,
                 data_type
             );
-            return Ok(());
+            return Ok(StoreWriteOutcome::SkippedExisting);
         }
         let mut serialized = Vec::new();
         safe_serialize(data, &mut serialized, SAFE_SER_SIZE_LIMIT)?;
         self.internal_storage
             .insert(((*data_id, None), data_type.to_string()), serialized);
-        Ok(())
+        Ok(StoreWriteOutcome::Created)
     }
 
     async fn store_bytes(
@@ -210,18 +212,18 @@ impl Storage for RamStorage {
         bytes: &[u8],
         data_id: &RequestId,
         data_type: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<StoreWriteOutcome> {
         if self.data_exists(data_id, data_type).await? {
             tracing::warn!(
                 "The data {}-{} already exists. Keeping the data without overwriting",
                 data_id,
                 data_type
             );
-            return Ok(());
+            return Ok(StoreWriteOutcome::SkippedExisting);
         }
         self.internal_storage
             .insert(((*data_id, None), data_type.to_string()), bytes.to_vec());
-        Ok(())
+        Ok(StoreWriteOutcome::Created)
     }
 
     async fn delete_data(&mut self, data_id: &RequestId, data_type: &str) -> anyhow::Result<()> {
@@ -242,38 +244,7 @@ impl StorageExt for RamStorage {
         data_id: &RequestId,
         epoch_id: &EpochId,
         data_type: &str,
-    ) -> anyhow::Result<()> {
-        if self
-            .data_exists_at_epoch(data_id, epoch_id, data_type)
-            .await?
-        {
-            tracing::warn!(
-                "The data {}-{} already exists. Keeping the data without overwriting",
-                data_id,
-                data_type
-            );
-            return Ok(());
-        }
-        let mut serialized = Vec::new();
-        safe_serialize(data, &mut serialized, SAFE_SER_SIZE_LIMIT)?;
-        self.internal_storage.insert(
-            ((*data_id, Some(*epoch_id)), data_type.to_string()),
-            serialized,
-        );
-        println!(
-            "Stored data at epoch: ({}, {}, {})",
-            data_id, epoch_id, data_type
-        );
-        Ok(())
-    }
-
-    async fn store_bytes_at_epoch(
-        &mut self,
-        bytes: &[u8],
-        data_id: &RequestId,
-        epoch_id: &EpochId,
-        data_type: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<StoreWriteOutcome> {
         if self
             .data_exists_at_epoch(data_id, epoch_id, data_type)
             .await?
@@ -284,13 +255,41 @@ impl StorageExt for RamStorage {
                 data_type,
                 epoch_id
             );
-            return Ok(());
+            return Ok(StoreWriteOutcome::SkippedExisting);
+        }
+        let mut serialized = Vec::new();
+        safe_serialize(data, &mut serialized, SAFE_SER_SIZE_LIMIT)?;
+        self.internal_storage.insert(
+            ((*data_id, Some(*epoch_id)), data_type.to_string()),
+            serialized,
+        );
+        Ok(StoreWriteOutcome::Created)
+    }
+
+    async fn store_bytes_at_epoch(
+        &mut self,
+        bytes: &[u8],
+        data_id: &RequestId,
+        epoch_id: &EpochId,
+        data_type: &str,
+    ) -> anyhow::Result<StoreWriteOutcome> {
+        if self
+            .data_exists_at_epoch(data_id, epoch_id, data_type)
+            .await?
+        {
+            tracing::warn!(
+                "The data {}-{} at epoch {} already exists. Keeping the data without overwriting",
+                data_id,
+                data_type,
+                epoch_id
+            );
+            return Ok(StoreWriteOutcome::SkippedExisting);
         }
         self.internal_storage.insert(
             ((*data_id, Some(*epoch_id)), data_type.to_string()),
             bytes.to_vec(),
         );
-        Ok(())
+        Ok(StoreWriteOutcome::Created)
     }
 
     async fn delete_data_at_epoch(
@@ -367,7 +366,7 @@ impl Storage for FailingRamStorage {
         data: &T,
         data_id: &RequestId,
         data_type: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<StoreWriteOutcome> {
         if self.available_writes < 1 {
             anyhow::bail!("storage failed!")
         } else {
@@ -381,7 +380,7 @@ impl Storage for FailingRamStorage {
         bytes: &[u8],
         data_id: &RequestId,
         data_type: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<StoreWriteOutcome> {
         self.inner.store_bytes(bytes, data_id, data_type).await
     }
 
@@ -415,15 +414,11 @@ pub mod tests {
     }
 
     /// Test that files don't get silently overwritten
-    #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_overwrite_logic_ram() {
         let mut storage = RamStorage::new();
         test_store_bytes_does_not_overwrite_existing_bytes(&mut storage).await;
         test_store_data_does_not_overwrite_existing_data(&mut storage).await;
-        assert!(logs_contain(
-            "already exists. Keeping the data without overwriting"
-        ));
     }
 
     #[tokio::test]
@@ -444,13 +439,9 @@ pub mod tests {
         test_all_data_ids_with_only_epoch_data(&mut storage).await;
     }
 
-    #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_overwrite_logic_ram_on_epoch() {
         let mut storage = RamStorage::new();
         test_store_bytes_at_epoch_does_not_overwrite(&mut storage).await;
-        assert!(logs_contain(
-            "already exists. Keeping the data without overwriting"
-        ));
     }
 }

@@ -1,21 +1,21 @@
 use super::{EnvelopeLoad, EnvelopeStore, Keychain, RootKeyMeasurements};
 use crate::{
     anyhow_error_and_log,
-    backup::{operator::RecoveryValidationMaterial, BackupCiphertext},
+    backup::{BackupCiphertext, operator::RecoveryValidationMaterial},
     consts::SAFE_SER_SIZE_LIMIT,
     cryptography::{
         encryption::{Decrypt, Encrypt, UnifiedPrivateEncKey, UnifiedPublicEncKey},
         signatures::PublicSigKey,
     },
-    vault::storage::{read_versioned_at_request_id, StorageReader},
+    vault::storage::{StorageReader, read_versioned_at_request_id},
 };
 use itertools::Itertools;
-use kms_grpc::rpc_types::{PrivDataType, PubDataType};
 use kms_grpc::RequestId;
+use kms_grpc::rpc_types::{PrivDataType, PubDataType};
 use rand::{CryptoRng, Rng};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
-use tfhe::{named::Named, safe_serialization::safe_serialize, Unversionize, Versionize};
+use tfhe::{Unversionize, Versionize, named::Named, safe_serialization::safe_serialize};
 
 /// A keychain for managing secret shares.
 /// This key chain is used for backups in order to securely store and retrieve sensitive information.
@@ -253,12 +253,12 @@ mod tests {
     use super::*;
     use crate::{
         backup::{
-            custodian::{CustodianSetupMessagePayload, InternalCustodianContext, HEADER},
+            custodian::{CustodianSetupMessagePayload, HEADER, InternalCustodianContext},
             operator::InnerOperatorBackupOutput,
         },
         cryptography::{
             encryption::{Encryption, PkeScheme, PkeSchemeType},
-            signatures::{gen_sig_keys, PrivateSigKey, SigningSchemeType},
+            signatures::{PrivateSigKey, SigningSchemeType, gen_sig_keys},
             signcryption::UnifiedSigncryption,
         },
         engine::base::derive_request_id,
@@ -270,7 +270,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tfhe::safe_serialization::safe_serialize;
-    use threshold_fhe::execution::runtime::party::Role;
+    use threshold_types::role::Role;
 
     #[tokio::test]
     async fn test_new_keychain_without_pub_storage() {
@@ -346,10 +346,12 @@ mod tests {
         let rng = AesRng::seed_from_u64(99);
         let keychain = SecretShareKeychain::new(rng, Some(&storage)).await.unwrap();
         let result = keychain.validate_recovery_material(&wrong_verf_key);
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid signature"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid signature")
+        );
     }
 
     #[tokio::test]
@@ -397,7 +399,7 @@ mod tests {
             .collect();
         let custodian_context = CustodianContext {
             custodian_nodes: setup_msgs,
-            context_id: Some(backup_id.into()),
+            custodian_context_id: Some(backup_id.into()),
             threshold: 1,
         };
         let internal_custodian_context =
@@ -421,9 +423,14 @@ mod tests {
             commitments.insert(role, vec![i as u8; 32]);
         }
 
-        let rec_material =
-            RecoveryValidationMaterial::new(cts, commitments, internal_custodian_context, &sig_key)
-                .unwrap();
+        let rec_material = RecoveryValidationMaterial::new(
+            cts,
+            commitments,
+            internal_custodian_context,
+            &sig_key,
+            kms_grpc::identifiers::ContextId::from_bytes([7u8; 32]),
+        )
+        .unwrap();
 
         // Store it in RamStorage
         let mut storage = RamStorage::default();

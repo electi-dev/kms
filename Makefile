@@ -41,6 +41,7 @@ clean-backward-compatibility-data:
 	rm -rf backward-compatibility/data/0_11_1
 	rm -rf backward-compatibility/data/0_13_0
 	rm -rf backward-compatibility/data/0_13_10
+	rm -rf backward-compatibility/data/0_13_20
 
 generate-backward-compatibility-v0.11.0:
 	cd backward-compatibility/generate-v0.11.0 && cargo run --release
@@ -53,20 +54,24 @@ generate-backward-compatibility-v0.13.0:
 
 generate-backward-compatibility-v0.13.10:
 	cd backward-compatibility/generate-v0.13.10 && cargo run --release
+	
+generate-backward-compatibility-v0.13.20:
+	cd backward-compatibility/generate-v0.13.20 && cargo run --release
 
-generate-backward-compatibility-all: clean-backward-compatibility-data generate-backward-compatibility-v0.11.0 generate-backward-compatibility-v0.11.1 generate-backward-compatibility-v0.13.0 generate-backward-compatibility-v0.13.10
+generate-backward-compatibility-all: clean-backward-compatibility-data generate-backward-compatibility-v0.11.0 generate-backward-compatibility-v0.11.1 generate-backward-compatibility-v0.13.0 generate-backward-compatibility-v0.13.10 generate-backward-compatibility-v0.13.20
 	@echo "Generated backward compatibility data for all versions"
 
 # Test material generation targets
 generate-test-material-all:
-	cargo run -p generate-test-material --features slow_tests -- --output ./test-material --verbose all
+	cargo run -p generate-test-material -- --output ./test-material --verbose --profile insecure --parties 4,10
+	cargo run -p generate-test-material -- --output ./test-material --verbose --profile secure --parties 4,10,13
 
 generate-test-material-testing:
 	@echo "Generating testing material..."
-	cargo run -p generate-test-material -- --output ./test-material --verbose testing
+	cargo run -p generate-test-material -- --output ./test-material --verbose --profile insecure --parties 4,10
 
 generate-test-material-default:
-	cargo run -p generate-test-material --features slow_tests -- --output ./test-material --verbose default
+	cargo run -p generate-test-material -- --output ./test-material --verbose --profile secure --parties 4,10,13
 
 validate-test-material:
 	cargo run -p generate-test-material -- --output ./test-material --verbose validate

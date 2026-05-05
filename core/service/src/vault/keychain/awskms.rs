@@ -1,25 +1,25 @@
 use super::{
-    decrypt_under_data_key, encrypt_under_data_key, AppKeyBlob, EnvelopeLoad, EnvelopeStore,
-    Keychain, RootKeyMeasurements,
+    AppKeyBlob, EnvelopeLoad, EnvelopeStore, Keychain, RootKeyMeasurements, decrypt_under_data_key,
+    encrypt_under_data_key,
 };
 use crate::{
     anyhow_error_and_log, consts::SAFE_SER_SIZE_LIMIT, cryptography::attestation::SecurityModule,
     some_or_err,
 };
 use aes::{
-    cipher::{block_padding::Pkcs7, BlockDecryptMut, IvSizeUser, KeyIvInit, KeySizeUser},
     Aes256,
+    cipher::{BlockDecryptMut, IvSizeUser, KeyIvInit, KeySizeUser, block_padding::Pkcs7},
 };
 use anyhow::{anyhow, bail, ensure};
 use aws_config::SdkConfig;
 use aws_sdk_kms::{
+    Client as AWSKMSClient,
     primitives::Blob,
     types::{
         DataKeySpec::Aes256 as Aes256Type, EncryptionAlgorithmSpec, KeyEncryptionMechanism,
         KeySpec::Rsa4096 as Rsa4096Type, KeyUsageType::EncryptDecrypt, OriginType,
         RecipientInfo as KMSRecipientInfo,
     },
-    Client as AWSKMSClient,
 };
 use aws_smithy_runtime::client::http::hyper_014::HyperClientBuilder;
 use hyper_rustls::HttpsConnectorBuilder;
@@ -34,19 +34,19 @@ use rasn::{
     types::{Integer, OctetString, Oid},
 };
 use rasn_cms::{
-    algorithms::AES256_CBC, ContentInfo, EnvelopedData, RecipientInfo, CONTENT_DATA,
-    CONTENT_ENVELOPED_DATA,
+    CONTENT_DATA, CONTENT_ENVELOPED_DATA, ContentInfo, EnvelopedData, RecipientInfo,
+    algorithms::AES256_CBC,
 };
 use rsa::{
+    Oaep, RsaPrivateKey, RsaPublicKey,
     pkcs8::{DecodePublicKey, EncodePublicKey},
     sha2::Sha256,
-    Oaep, RsaPrivateKey, RsaPublicKey,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 use tfhe::safe_serialization::{safe_deserialize, safe_serialize};
-use tfhe::{named::Named, Unversionize, Versionize};
-use threshold_fhe::networking::tls::ReleasePCRValues;
+use tfhe::{Unversionize, Versionize, named::Named};
+use threshold_networking::tls::ReleasePCRValues;
 use url::Url;
 
 // recipient enclave RSA keypair size
@@ -158,7 +158,10 @@ impl Asymm {
             get_public_key_response.key_usage,
             "No key usage returned for the root public key by AWS KMS".to_string(),
         )?;
-        ensure!(pk_usage == EncryptDecrypt, "Root public key is not allowed to be used for encryption/decryption: check AWS KMS key policy");
+        ensure!(
+            pk_usage == EncryptDecrypt,
+            "Root public key is not allowed to be used for encryption/decryption: check AWS KMS key policy"
+        );
 
         let pk_bytes = some_or_err(
             get_public_key_response.public_key,
@@ -479,7 +482,7 @@ pub fn decrypt_ciphertext_for_recipient(
 
     // validate the PKCS7 envelope
     ensure!(
-        envelope.version == Integer::Primitive(AWS_KMS_ENVELOPED_DATA_VERSION),
+        envelope.version == Integer::from(AWS_KMS_ENVELOPED_DATA_VERSION),
         "User decrypted ciphertext envelope must have version {}, actual version: {}",
         AWS_KMS_ENVELOPED_DATA_VERSION,
         envelope.version
@@ -494,14 +497,15 @@ pub fn decrypt_ciphertext_for_recipient(
         bail!("User decrypted ciphertext envelope does not contain a recipient");
     };
     ensure!(
-        ktri.version == Integer::Primitive(AWS_KMS_ENVELOPED_DATA_RECIPIENT_VERSION),
+        ktri.version == Integer::from(AWS_KMS_ENVELOPED_DATA_RECIPIENT_VERSION),
         "User decrypted ciphertext envelope recipient info must have version {}, actual version: {}",
         AWS_KMS_ENVELOPED_DATA_RECIPIENT_VERSION,
         ktri.version
     );
-    ensure!(ktri.key_encryption_algorithm.algorithm == Oid:: ISO_MEMBER_BODY_US_RSADSI_PKCS1_RSAES_OAEP,
-	    "User decrypted ciphertext envelope must use RSA-OAEP for envelope encryption, actual algorithm: {}",
-	    ktri.key_encryption_algorithm.algorithm
+    ensure!(
+        ktri.key_encryption_algorithm.algorithm == Oid::ISO_MEMBER_BODY_US_RSADSI_PKCS1_RSAES_OAEP,
+        "User decrypted ciphertext envelope must use RSA-OAEP for envelope encryption, actual algorithm: {}",
+        ktri.key_encryption_algorithm.algorithm
     );
     ensure!(
         envelope.encrypted_content_info.content_type == CONTENT_DATA,
@@ -509,9 +513,16 @@ pub fn decrypt_ciphertext_for_recipient(
         envelope.encrypted_content_info.content_type
     );
     ensure!(
-	envelope.encrypted_content_info.content_encryption_algorithm.algorithm == AES256_CBC,
-	"User decrypted ciphertext envelope must use AES-256-CBC for content encryption, actual algorithm: {}",
-	envelope.encrypted_content_info.content_encryption_algorithm.algorithm
+        envelope
+            .encrypted_content_info
+            .content_encryption_algorithm
+            .algorithm
+            == AES256_CBC,
+        "User decrypted ciphertext envelope must use AES-256-CBC for content encryption, actual algorithm: {}",
+        envelope
+            .encrypted_content_info
+            .content_encryption_algorithm
+            .algorithm
     );
     let enc_session_key = ktri.encrypted_key.as_ref();
     let Some(iv_string) = envelope
@@ -519,7 +530,9 @@ pub fn decrypt_ciphertext_for_recipient(
         .content_encryption_algorithm
         .parameters
     else {
-        bail!("User decrypted ciphertext envelope does not contain an AES-256-CBC initialization vector")
+        bail!(
+            "User decrypted ciphertext envelope does not contain an AES-256-CBC initialization vector"
+        )
     };
     let Some(enc_payload) = envelope.encrypted_content_info.encrypted_content else {
         bail!("User decrypted ciphertext envelope does not contain a payload")
@@ -542,10 +555,11 @@ pub fn decrypt_ciphertext_for_recipient(
     // decode the initialization vector from ASN.1
     let mut iv_decoder = Decoder::new(iv_string.as_ref(), DecoderOptions::ber());
     let iv = OctetString::decode(&mut iv_decoder)?;
-    ensure!(iv.len() == cbc::Decryptor::<Aes256>::iv_size(),
-	    "User decrypted ciphertext envelope initialization vector is not {} bits long, actual length: {} bits",
-	    cbc::Decryptor::<Aes256>::iv_size() * 8,
-	    iv.len() * 8
+    ensure!(
+        iv.len() == cbc::Decryptor::<Aes256>::iv_size(),
+        "User decrypted ciphertext envelope initialization vector is not {} bits long, actual length: {} bits",
+        cbc::Decryptor::<Aes256>::iv_size() * 8,
+        iv.len() * 8
     );
 
     // decrypt the ciphertext for recipient enclave

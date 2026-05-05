@@ -7,20 +7,21 @@ use crate::cryptography::{
         Unsigncrypt,
     },
 };
-use crate::engine::validation::{parse_optional_grpc_request_id, RequestIdParsingErr};
+use crate::engine::validation::{RequestIdParsingErr, parse_optional_grpc_request_id};
 use crate::{consts::SAFE_SER_SIZE_LIMIT, cryptography::signatures::PublicSigKey};
+use hashing::DomainSep;
+use kms_grpc::RequestId;
 use kms_grpc::kms::v1::{
     CustodianContext, CustodianRecoveryOutput, CustodianSetupMessage, OperatorBackupOutput,
 };
-use kms_grpc::RequestId;
 use rand::{CryptoRng, Rng};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tfhe::safe_serialization::safe_serialize;
-use tfhe::{named::Named, safe_serialization::safe_deserialize, Versionize};
+use tfhe::{Versionize, named::Named, safe_serialization::safe_deserialize};
 use tfhe_versionable::VersionsDispatch;
-use threshold_fhe::{execution::runtime::party::Role, hashing::DomainSep};
+use threshold_types::role::Role;
 
 use super::{
     error::BackupError,
@@ -42,6 +43,7 @@ pub struct InternalCustodianRecoveryOutput {
     pub signcryption: UnifiedSigncryption,
     pub custodian_role: Role,
     pub operator_verification_key: PublicSigKey,
+    pub mpc_context_id: RequestId,
 }
 
 impl Named for InternalCustodianRecoveryOutput {
@@ -66,6 +68,13 @@ impl TryFrom<CustodianRecoveryOutput> for InternalCustodianRecoveryOutput {
         let backup_output = &value.backup_output.ok_or_else(|| {
             anyhow::anyhow!("backup output not part of the custodian recovery output")
         })?;
+        let mpc_context_id = value
+            .mpc_context_id
+            .ok_or_else(|| {
+                anyhow::anyhow!("MPC context ID not part of the custodian recovery output")
+            })?
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Failed to parse MPC context ID: {}", e))?;
         Ok(InternalCustodianRecoveryOutput {
             signcryption: UnifiedSigncryption::new(
                 backup_output.signcryption.clone(),
@@ -74,6 +83,7 @@ impl TryFrom<CustodianRecoveryOutput> for InternalCustodianRecoveryOutput {
             ),
             custodian_role: Role::indexed_from_one(value.custodian_role as usize),
             operator_verification_key: verification_key,
+            mpc_context_id,
         })
     }
 }
@@ -91,6 +101,7 @@ impl TryFrom<InternalCustodianRecoveryOutput> for CustodianRecoveryOutput {
             }),
             custodian_role: value.custodian_role.one_based() as u64,
             operator_verification_key: verification_key_buf,
+            mpc_context_id: Some(value.mpc_context_id.into()),
         })
     }
 }
@@ -229,8 +240,9 @@ impl InternalCustodianContext {
             }
             if setup_message.custodian_role > custodian_context.custodian_nodes.len() as u64 {
                 return Err(anyhow::anyhow!(
-                        "Custodian role {} is greater than the number of custodians in custodian context", setup_message.custodian_role
-                    ));
+                    "Custodian role {} is greater than the number of custodians in custodian context",
+                    setup_message.custodian_role
+                ));
             }
             let internal_msg: InternalCustodianSetupMessage =
                 setup_message.to_owned().try_into()?;
@@ -245,7 +257,7 @@ impl InternalCustodianContext {
             }
         }
         let context_id: RequestId = parse_optional_grpc_request_id(
-            &custodian_context.context_id,
+            &custodian_context.custodian_context_id,
             RequestIdParsingErr::CustodianContext,
         )?;
         Ok(InternalCustodianContext {
@@ -301,6 +313,7 @@ impl Custodian {
         &self,
         rng: &mut R,
         backup: &InnerOperatorBackupOutput,
+        mpc_context_id: RequestId,
         operator_verification_key: &PublicSigKey,
         operator_ephem_enc_key: &UnifiedPublicEncKey,
         backup_id: RequestId,
@@ -359,6 +372,7 @@ impl Custodian {
             signcryption,
             custodian_role: self.role,
             operator_verification_key: operator_verification_key.clone(),
+            mpc_context_id,
         })
     }
 
@@ -434,15 +448,17 @@ mod tests {
         };
         let context = CustodianContext {
             custodian_nodes: vec![setup_msg1, setup_msg2, setup_msg3],
-            context_id: None,
+            custodian_context_id: None,
             threshold: 1,
         };
         let result = InternalCustodianContext::new(context, backup_pk);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Custodian role cannot be zero"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Custodian role cannot be zero")
+        );
     }
 
     #[test]
@@ -462,16 +478,18 @@ mod tests {
         };
         let context = CustodianContext {
             custodian_nodes: vec![setup_msg1, setup_msg2],
-            context_id: None,
+            custodian_context_id: None,
             threshold: 1, // Invalid threshold, since 1 is not less than 2/2
         };
         let result = InternalCustodianContext::new(context, backup_pk.clone());
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Invalid threshold in custodian context"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Invalid threshold in custodian context")
+        );
     }
 
     #[test]
@@ -507,16 +525,18 @@ mod tests {
         };
         let context = CustodianContext {
             custodian_nodes: vec![setup_msg1, setup_msg2, setup_msg3],
-            context_id: None,
+            custodian_context_id: None,
             threshold: 1,
         };
         let result = InternalCustodianContext::new(context, backup_pk.clone());
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Duplicate custodian role found"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Duplicate custodian role found")
+        );
     }
 
     #[test]
@@ -541,7 +561,7 @@ mod tests {
         };
         let context = CustodianContext {
             custodian_nodes: vec![setup_msg1, setup_msg2, setup_msg3],
-            context_id: None,
+            custodian_context_id: None,
             threshold: 1,
         };
         let result = InternalCustodianContext::new(context, backup_pk.clone());

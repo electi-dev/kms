@@ -1,13 +1,13 @@
 use crate::cryptography::internal_crypto_types::LegacySerialization;
 use crate::engine::base::compute_external_pt_signature;
 use crate::engine::centralized::central_kms::{
-    async_user_decrypt, central_public_decrypt, CentralizedKms,
+    CentralizedKms, async_user_decrypt, central_public_decrypt,
 };
 use crate::engine::traits::{BackupOperator, BaseKms, ContextManager};
 use crate::engine::utils::MetricedError;
 use crate::engine::validation::{
-    parse_grpc_request_id, validate_public_decrypt_req, validate_user_decrypt_req,
-    RequestIdParsingErr, DSEP_PUBLIC_DECRYPTION, DSEP_USER_DECRYPTION,
+    DSEP_PUBLIC_DECRYPTION, DSEP_USER_DECRYPTION, RequestIdParsingErr, parse_grpc_request_id,
+    validate_public_decrypt_req, validate_user_decrypt_req,
 };
 use crate::util::meta_store::{
     add_req_to_meta_store, retrieve_from_meta_store, update_err_req_in_meta_store,
@@ -21,7 +21,7 @@ use kms_grpc::kms::v1::{
 use observability::metrics::METRICS;
 use observability::metrics_names::{
     CENTRAL_TAG, OP_PUBLIC_DECRYPT_REQUEST, OP_PUBLIC_DECRYPT_RESULT, OP_USER_DECRYPT_REQUEST,
-    OP_USER_DECRYPT_RESULT, TAG_CONTEXT_ID, TAG_EPOCH_ID, TAG_KEY_ID, TAG_PARTY_ID,
+    OP_USER_DECRYPT_RESULT, TAG_PARTY_ID,
 };
 use std::sync::Arc;
 use tonic::{Request, Response};
@@ -38,7 +38,7 @@ pub async fn user_decrypt_impl<
     request: Request<UserDecryptionRequest>,
 ) -> Result<Response<Empty>, MetricedError> {
     let permit = service.rate_limiter.start_user_decrypt().await?;
-    let mut timer = METRICS
+    let timer = METRICS
         .time_operation(OP_USER_DECRYPT_REQUEST)
         .tag(TAG_PARTY_ID, CENTRAL_TAG.to_string())
         .start();
@@ -47,7 +47,7 @@ pub async fn user_decrypt_impl<
     let (
         typed_ciphertexts,
         link,
-        client_enc_key,
+        client_enc_key_bytes,
         client_address,
         request_id,
         key_id,
@@ -69,14 +69,6 @@ pub async fn user_decrypt_impl<
         ));
     }
     // Observe we accept any epoch ID
-
-    // Use a constant party ID since this is the central KMS
-    let metric_tags = vec![
-        (TAG_KEY_ID, key_id.to_string()),
-        (TAG_CONTEXT_ID, context_id.to_string()),
-        (TAG_EPOCH_ID, epoch_id.to_string()),
-    ];
-    timer.tags(metric_tags.clone());
 
     match service
         .crypto_storage
@@ -152,11 +144,10 @@ pub async fn user_decrypt_impl<
                 &mut rng,
                 &typed_ciphertexts,
                 &link,
-                &client_enc_key,
+                &client_enc_key_bytes,
                 &client_address,
                 server_verf_key,
                 &domain,
-                metric_tags,
                 &extra_data,
             )
             .await;
@@ -243,7 +234,7 @@ pub async fn public_decrypt_impl<
     request: Request<PublicDecryptionRequest>,
 ) -> Result<Response<Empty>, MetricedError> {
     let permit = service.rate_limiter.start_pub_decrypt().await?;
-    let mut timer = METRICS
+    let timer = METRICS
         .time_operation(OP_PUBLIC_DECRYPT_REQUEST)
         // Use a constant party ID since this is the central KMS
         .tag(TAG_PARTY_ID, CENTRAL_TAG.to_string())
@@ -265,13 +256,6 @@ pub async fn public_decrypt_impl<
         ));
     }
     // Observe we accept any epoch ID
-
-    let metric_tags = vec![
-        (TAG_KEY_ID, key_id.to_string()),
-        (TAG_CONTEXT_ID, context_id.to_string()),
-        (TAG_EPOCH_ID, epoch_id.to_string()),
-    ];
-    timer.tags(metric_tags.clone());
 
     let keys_exist = match service
         .crypto_storage
@@ -360,8 +344,7 @@ pub async fn public_decrypt_impl<
         // run the computation in a separate rayon thread to avoid blocking the tokio runtime
         let (send, recv) = tokio::sync::oneshot::channel();
         rayon::spawn_fifo(move || {
-            let decryptions =
-                central_public_decrypt::<PubS, PrivS>(&keys, &ciphertexts, metric_tags);
+            let decryptions = central_public_decrypt::<PubS, PrivS>(&keys, &ciphertexts);
             let _ = send.send(decryptions);
         });
         let decryptions = recv.await;
@@ -371,10 +354,10 @@ pub async fn public_decrypt_impl<
                 // sign the plaintexts and handles for external verification (in fhevm)
                 match compute_external_pt_signature(
                     &sig_key,
-                    ext_handles_bytes,
+                    &ext_handles_bytes,
                     &pts,
                     &extra_data,
-                    eip712_domain,
+                    &eip712_domain,
                 ) {
                     Ok(sig) => Ok((request_id, pts, sig, extra_data)),
                     Err(e) => Err(format!("Failed to compute external signature: {e:?}")),
@@ -494,7 +477,8 @@ pub async fn get_public_decryption_result_impl<
 #[cfg(test)]
 pub(crate) mod tests {
     use aes_prng::AesRng;
-    use kms_grpc::{kms::v1::TypedCiphertext, RequestId};
+    use kms_grpc::{RequestId, kms::v1::TypedCiphertext};
+    use tfhe::xof_key_set::CompressedXofKeySet;
 
     use crate::{
         cryptography::signatures::PublicSigKey,
@@ -502,8 +486,8 @@ pub(crate) mod tests {
             central_kms::RealCentralizedKms,
             service::key_gen::tests::{setup_test_kms_with_preproc, test_standard_keygen},
         },
-        util::key_setup::test_tools::{compute_cipher, EncryptionConfig, TestingPlaintext},
-        vault::storage::ram::RamStorage,
+        util::key_setup::test_tools::{EncryptionConfig, TestingPlaintext, compute_cipher},
+        vault::storage::{crypto_material::CryptoMaterialReader, ram::RamStorage},
     };
 
     // This function will also output a public key and load the server key into memory
@@ -519,22 +503,18 @@ pub(crate) mod tests {
         let preproc_id: RequestId = RequestId::new_random(rng);
         let (kms, verf_key) = setup_test_kms_with_preproc(rng, &preproc_id).await;
 
-        // at this point the key is generated
+        // at this point the key is generated (compressed by default)
         // We execute in the secure mode, i.e. pretending that the preprocessing is done
         test_standard_keygen(&kms, key_id, &preproc_id, false).await;
 
-        let pk = kms
-            .crypto_storage
-            .inner
-            .read_cloned_pk(key_id)
-            .await
-            .unwrap();
-        let key = kms
-            .crypto_storage
-            .inner
-            .read_cloned_server_key(key_id)
-            .await
-            .unwrap();
+        // Read compressed keyset and decompress to get pk + server key
+        let compressed_keyset: CompressedXofKeySet = {
+            let storage = kms.crypto_storage.inner.public_storage.lock().await;
+            CryptoMaterialReader::read_from_storage(&*storage, key_id)
+                .await
+                .unwrap()
+        };
+        let (pk, key) = compressed_keyset.decompress().unwrap().into_raw_parts();
         tfhe::set_server_key(key);
 
         (kms, pk, verf_key)

@@ -9,19 +9,19 @@ use crate::vault::storage::{StorageExt, StorageReader, StorageReaderExt};
 use crate::{
     anyhow_error_and_warn_log,
     client::client_non_wasm::ClientDataType,
-    vault::storage::{read_all_data_versioned, Storage},
+    vault::storage::{Storage, read_all_data_versioned},
 };
 use aes_prng::AesRng;
+use kms_grpc::RequestId;
 use kms_grpc::identifiers::EpochId;
 use kms_grpc::rpc_types::{PrivDataType, PubDataType};
-use kms_grpc::RequestId;
 use rand::SeedableRng;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::fmt::Display;
-use tfhe::{named::Named, Unversionize};
-use threshold_fhe::execution::tfhe_internals::parameters::DKGParams;
-use threshold_fhe::execution::zk::ceremony::max_num_messages;
+use tfhe::{Unversionize, named::Named};
+use threshold_execution::tfhe_internals::parameters::DKGParams;
+use threshold_execution::zk::ceremony::max_num_messages;
 
 /// Creates a new random number generator instance.
 ///
@@ -195,11 +195,15 @@ pub fn log_data_exists<T: Display, U: Display, V: Display>(
     match pub_storage_info {
         Some(pub_info) => tracing::info!(
             "{} with ID {} already exist for private storage \"{}\" and public storage \"{}\", skipping generation",
-            data_type, id, storage_info, pub_info
+            data_type,
+            id,
+            storage_info,
+            pub_info
         ),
         None => tracing::info!(
             "{} with ID {} already exist, skipping generation",
-            data_type, id
+            data_type,
+            id
         ),
     }
 }
@@ -284,8 +288,7 @@ pub fn log_storage_success_optional_variant<T: Display, U: Display>(
 /// suboptimal cryptographic parameters.
 pub fn calculate_max_num_bits(dkg_params: &DKGParams) -> usize {
     // Extract constant to improve readability
-    const DEFAULT_MAX_NUM_BITS: usize =
-        threshold_fhe::execution::zk::constants::ZK_DEFAULT_MAX_NUM_BITS;
+    const DEFAULT_MAX_NUM_BITS: usize = threshold_execution::zk::constants::ZK_DEFAULT_MAX_NUM_BITS;
     const FALLBACK_BITS: usize = 16;
 
     // Cache the params_basics_handle to avoid calling it twice
@@ -343,7 +346,7 @@ async fn get_unique<
         .map_err(|e| {
             anyhow_error_and_warn_log(format!(
                 "Failed to read {} from \"{}\": {e}",
-                &data_type.to_string(),
+                data_type,
                 storage.info()
             ))
         })?;

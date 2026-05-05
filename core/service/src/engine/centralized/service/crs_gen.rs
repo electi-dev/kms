@@ -7,24 +7,26 @@ use kms_grpc::kms::v1::{CrsGenRequest, CrsGenResult, Empty};
 use kms_grpc::{EpochId, RequestId};
 use observability::metrics::METRICS;
 use observability::metrics_names::{
-    CENTRAL_TAG, OP_CRS_GEN_REQUEST, OP_CRS_GEN_RESULT, OP_INSECURE_CRS_GEN_REQUEST,
-    TAG_CONTEXT_ID, TAG_CRS_ID, TAG_PARTY_ID,
+    CENTRAL_TAG, OP_CRS_GEN_ABORT, OP_CRS_GEN_REQUEST, OP_CRS_GEN_RESULT,
+    OP_INSECURE_CRS_GEN_REQUEST, TAG_PARTY_ID,
 };
-use threshold_fhe::execution::tfhe_internals::parameters::DKGParams;
+use threshold_execution::tfhe_internals::parameters::DKGParams;
+use tokio_util::sync::CancellationToken;
+
 use tokio::sync::RwLock;
 use tonic::{Request, Response};
 use tracing::Instrument;
 
 use crate::cryptography::signatures::PrivateSigKey;
 use crate::engine::base::CrsGenMetadata;
-use crate::engine::centralized::central_kms::{async_generate_crs, CentralizedKms};
+use crate::engine::centralized::central_kms::{CentralizedKms, async_generate_crs};
 use crate::engine::traits::{BackupOperator, ContextManager};
 use crate::engine::utils::MetricedError;
 use crate::engine::validation::{
-    parse_grpc_request_id, validate_crs_gen_request, RequestIdParsingErr,
+    RequestIdParsingErr, parse_grpc_request_id, validate_crs_gen_request,
 };
 use crate::util::meta_store::{
-    add_req_to_meta_store, retrieve_from_meta_store, update_err_req_in_meta_store, MetaStore,
+    MetaStore, add_req_to_meta_store, retrieve_from_meta_store, update_err_req_in_meta_store,
 };
 use crate::vault::storage::crypto_material::CentralizedCryptoMaterialStorage;
 use crate::vault::storage::{Storage, StorageExt};
@@ -49,18 +51,13 @@ pub async fn crs_gen_impl<
     };
 
     let permit = service.rate_limiter.start_crsgen(op_tag).await?;
-    let mut timer = METRICS
+    let timer = METRICS
         .time_operation(op_tag)
         .tag(TAG_PARTY_ID, CENTRAL_TAG.to_string())
         .start();
     let inner = request.into_inner();
     let max_bits = inner.max_num_bits;
     let verified = validate_crs_gen_request(inner, op_tag)?;
-    let metric_tags = vec![
-        (TAG_CRS_ID, verified.req_id.to_string()),
-        (TAG_CONTEXT_ID, verified.context_id.to_string()),
-    ];
-    timer.tags(metric_tags.clone());
 
     if !service
         .context_manager
@@ -85,7 +82,9 @@ pub async fn crs_gen_impl<
     )?;
 
     let meta_store = Arc::clone(&service.crs_meta_map);
+    let meta_store_cancel = Arc::clone(&service.crs_meta_map);
     let crypto_storage = service.crypto_storage.clone();
+    let crypto_storage_cancel = service.crypto_storage.clone();
     let sk = service
             .base_kms
             .sig_key()
@@ -100,24 +99,62 @@ pub async fn crs_gen_impl<
 
     let rng = service.base_kms.new_rng().await;
 
+    let req_id = verified.req_id;
+    let epoch_id = verified.epoch_id;
+    let token = CancellationToken::new();
+    {
+        service
+            .ongoing_crs_gen
+            .lock()
+            .await
+            .insert(req_id, token.clone());
+    }
+    let ongoing = Arc::clone(&service.ongoing_crs_gen);
+
     service.tracker.spawn(
         async move {
             let _timer = timer;
             let _permit = permit;
-            crs_gen_background(
-                &verified.req_id,
-                &verified.epoch_id,
-                rng,
-                meta_store,
-                crypto_storage,
-                sk,
-                verified.params,
-                verified.eip712_domain,
-                verified.extra_data,
-                max_bits,
-                op_tag,
-            )
-            .await;
+            tokio::select! {
+                () = crs_gen_background(
+                    &req_id,
+                    &epoch_id,
+                    rng,
+                    meta_store,
+                    crypto_storage,
+                    sk,
+                    verified.params,
+                    verified.eip712_domain,
+                    verified.extra_data,
+                    max_bits,
+                    op_tag,
+                ) => {
+                    tracing::info!("CRS generation of request {} exiting normally.", req_id);
+                    // Remove cancellation token since generation is now done.
+                    ongoing.lock().await.remove(&req_id);
+                },
+                () = token.cancelled() => {
+                    MetricedError::handle_unreturnable_error(
+                        OP_CRS_GEN_REQUEST,
+                        Some(req_id),
+                        anyhow::anyhow!("CRS generation of request {} exiting before completion because of an abort request.", req_id),
+                    );
+                    let del_res = crypto_storage_cancel.inner.purge_crs_material(&req_id, &epoch_id).await;
+                    {
+                        let mut guarded_meta_store = meta_store_cancel.write().await;
+                        let msg = if del_res {
+                            let msg = format!("CRS generation aborted and CRS material deleted successfully for request {}", req_id);
+                            tracing::info!(msg);
+                            msg
+                        } else {
+                            let msg = format!("CRS generation aborted but failed to delete CRS material for request {}", req_id);
+                            tracing::error!(msg);
+                            msg
+                        };
+                        update_err_req_in_meta_store(&mut guarded_meta_store, &req_id, msg, OP_CRS_GEN_REQUEST);
+                    }
+                }
+            }
         }
         .instrument(tracing::Span::current()),
     );
@@ -192,6 +229,36 @@ pub async fn get_crs_gen_result_impl<
     }
 }
 
+pub async fn abort_crs_gen_impl<
+    PubS: Storage + Sync + Send + 'static,
+    PrivS: StorageExt + Sync + Send + 'static,
+    CM: ContextManager + Sync + Send + 'static,
+    BO: BackupOperator + Sync + Send + 'static,
+>(
+    service: &CentralizedKms<PubS, PrivS, CM, BO>,
+    request: Request<kms_grpc::kms::v1::RequestId>,
+) -> Result<Response<Empty>, MetricedError> {
+    let request_id = parse_grpc_request_id(&request.into_inner(), RequestIdParsingErr::CrsGenAbort)
+        .map_err(|e| MetricedError::new(OP_CRS_GEN_ABORT, None, e, tonic::Code::InvalidArgument))?;
+    match service.ongoing_crs_gen.lock().await.remove(&request_id) {
+        Some(cancellation_token) => {
+            // Observe that the cancellation arm handles the abortion and clean-up
+            cancellation_token.cancel();
+            tracing::info!("Aborted CRS generation with request ID {}", request_id);
+            Ok(Response::new(Empty {}))
+        }
+        None => {
+            // No CRS generation happening; nothing to cancel
+            Err(MetricedError::new(
+                OP_CRS_GEN_ABORT,
+                Some(request_id),
+                anyhow::anyhow!("No ongoing CRS generation found for the supplied request ID"),
+                tonic::Code::NotFound,
+            ))
+        }
+    }
+}
+
 /// Background task for CRS generation
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn crs_gen_background<
@@ -235,14 +302,24 @@ pub(crate) async fn crs_gen_background<
         }
     };
 
-    crypto_storage
+    if let Err(e) = crypto_storage
+        .inner
         .write_crs_with_meta_store(req_id, epoch_id, pp, crs_info, meta_store, op_tag)
+        .await
+    {
+        tracing::error!("Failed to write CRS to storage: {e}");
+        return;
+    }
+    // Update the backup and handle potential failures by incrementing backup errors in the metrics
+    crypto_storage
+        .inner
+        .update_backup_vault(false, op_tag)
         .await;
 
-    tracing::info!("⏱️ Core Event Time for CRS-gen: {:?}", start.elapsed());
     tracing::info!(
-        "CRS generation of request {} completed successfully.",
-        req_id
+        "⏱️ Core Event Time for CRS-gen request id {}: {:?}",
+        req_id,
+        start.elapsed()
     );
 }
 
@@ -252,6 +329,7 @@ mod tests {
     use rand::SeedableRng;
 
     use crate::{
+        consts::DEFAULT_EPOCH_ID,
         dummy_domain,
         engine::{base::derive_request_id, centralized::service::tests::setup_central_test_kms},
     };
@@ -440,7 +518,38 @@ mod tests {
             assert_eq!(err.code(), tonic::Code::InvalidArgument);
         }
 
-        // missing epoch ID
+        // TODO: re-enable the following tests after the default epoch fallback is removed in validation
+        // https://github.com/zama-ai/kms-internal/issues/2758
+        //
+        // // missing epoch ID
+        // {
+        //     let request = CrsGenRequest {
+        //         request_id: Some(req_id.into()),
+        //         epoch_id: None, // missing
+        //         context_id: None,
+        //         params: FheParameter::Test.into(),
+        //         domain: Some(domain),
+        //         extra_data: vec![],
+        //         max_num_bits: None,
+        //     };
+        //     let err = crs_gen_impl(&kms, Request::new(request), false)
+        //         .await
+        //         .unwrap_err();
+        //     assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        // }
+    }
+
+    // test the missing epoch ID case that is currently allowed with a warning, to make sure the default epoch fallback works, and to prepare for the future removal of the default epoch fallback
+    // TODO: remove following tests after the default epoch fallback is no longer used in validation
+    // https://github.com/zama-ai/kms-internal/issues/2758
+    #[tokio::test]
+    async fn default_epoch_id() {
+        let mut rng = AesRng::seed_from_u64(54321);
+        let (kms, _) = setup_central_test_kms(&mut rng).await;
+        let req_id = derive_request_id("test_crs_gen_default_epoch").unwrap();
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+
+        // missing epoch ID should use default epoch with a warning, but not fail
         {
             let request = CrsGenRequest {
                 request_id: Some(req_id.into()),
@@ -451,10 +560,21 @@ mod tests {
                 extra_data: vec![],
                 max_num_bits: None,
             };
-            let err = crs_gen_impl(&kms, Request::new(request), false)
+            let _req = crs_gen_impl(&kms, Request::new(request), false)
                 .await
-                .unwrap_err();
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+                .unwrap();
+            let res = get_crs_gen_result_impl(&kms, Request::new(req_id.into()), false)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                res.into_inner()
+                    .request_id
+                    .unwrap()
+                    .request_id
+                    .to_ascii_lowercase(),
+                req_id.as_str()
+            );
         }
     }
 
@@ -490,5 +610,97 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn abort_not_found() {
+        let mut rng = AesRng::seed_from_u64(1234);
+        let (kms, _) = setup_central_test_kms(&mut rng).await;
+        let req_id = derive_request_id("test_crs_gen_abort_not_found").unwrap();
+        let err = abort_crs_gen_impl(&kms, Request::new(req_id.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn abort_during_crs_gen() {
+        let mut rng = AesRng::seed_from_u64(1234);
+        let (kms, _) = setup_central_test_kms(&mut rng).await;
+        let req_id = derive_request_id("abort_during_crs_gen_crs_id").unwrap();
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        let request = CrsGenRequest {
+            request_id: Some(req_id.into()),
+            epoch_id: Some((*DEFAULT_EPOCH_ID).into()), // use default epoch to make sure the test works even if the default epoch fallback is removed in validation
+            context_id: None,
+            params: FheParameter::Test.into(),
+            domain: Some(domain),
+            extra_data: vec![],
+            max_num_bits: Some(2048),
+        };
+        crs_gen_impl(&kms, Request::new(request), false)
+            .await
+            .unwrap();
+
+        // Abort before the background task finishes. The cancellation token is
+        // inserted synchronously inside `crs_gen_impl` before it returns, so the
+        // abort is guaranteed to find it. Generation with max_num_bits=2048 takes
+        // long enough that the cancel arm wins the `tokio::select!` race.
+        abort_crs_gen_impl(&kms, Request::new(req_id.into()))
+            .await
+            .unwrap();
+
+        // Second abort fails because the cancellation token has already been consumed.
+        let err = abort_crs_gen_impl(&kms, Request::new(req_id.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // The cancellation arm updates the meta store with an "aborted" error message,
+        // so retrieving the result returns Aborted (the meta store maps "abort" error
+        // messages to tonic::Code::Aborted).
+        let err = get_crs_gen_result_impl(&kms, Request::new(req_id.into()), false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Aborted);
+    }
+
+    #[tokio::test]
+    async fn abort_already_finished() {
+        let mut rng = AesRng::seed_from_u64(1234);
+        let (kms, _) = setup_central_test_kms(&mut rng).await;
+        let req_id = derive_request_id("test_crs_gen_abort_already_finished").unwrap();
+        let epoch_id = derive_request_id("test_crs_gen_abort_already_finished_epoch").unwrap();
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        let request = CrsGenRequest {
+            request_id: Some(req_id.into()),
+            epoch_id: Some(epoch_id.into()),
+            context_id: None,
+            params: FheParameter::Test.into(),
+            domain: Some(domain),
+            extra_data: vec![],
+            max_num_bits: Some(2048),
+        };
+        crs_gen_impl(&kms, Request::new(request), false)
+            .await
+            .unwrap();
+        // Block until CRS generation completes so the meta store entry is set
+        let _ = get_crs_gen_result_impl(&kms, Request::new(req_id.into()), false)
+            .await
+            .unwrap();
+
+        // Wait for the background task to remove the cancellation token after completion.
+        // The meta store is updated before the token removal, so poll until the ongoing map is empty.
+        for _ in 0..100 {
+            if !kms.ongoing_crs_gen.lock().await.contains_key(&req_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let err = abort_crs_gen_impl(&kms, Request::new(req_id.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 }

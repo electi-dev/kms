@@ -3,34 +3,44 @@
 //! This module provides the storage implementation for cryptographic material
 //! used in the threshold KMS variant.
 
+use observability::metrics_names::OP_NEW_EPOCH;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock, RwLockWriteGuard};
 
 use kms_grpc::{
+    RequestId,
     identifiers::EpochId,
     rpc_types::{KMSType, PrivDataType, PubDataType},
-    RequestId,
 };
 use tfhe::{
     integer::compression_keys::DecompressionKey, xof_key_set::CompressedXofKeySet,
     zk::CompactPkeCrs,
 };
-use threshold_fhe::execution::tfhe_internals::public_keysets::FhePubKeySet;
+use threshold_execution::tfhe_internals::public_keysets::FhePubKeySet;
 
 use crate::{
+    cryptography::signatures::{PrivateSigKey, compute_eip712_signature},
     engine::{
         base::{CrsGenMetadata, KeyGenMetadata},
-        threshold::service::ThresholdFheKeys,
+        threshold::service::{ThresholdFheKeys, session::PRSSSetupCombined},
+        utils::verify_public_key_digest_from_bytes,
     },
-    util::meta_store::MetaStore,
+    util::meta_store::update_err_req_in_meta_store,
+    util::meta_store::{
+        MetaStore, ensure_meta_store_request_pending, should_purge_after_meta_update_failure,
+    },
     vault::{
-        storage::{
-            crypto_material::log_storage_success, store_versioned_at_request_and_epoch_id,
-            store_versioned_at_request_id, Storage, StorageExt, StorageReader,
-        },
         Vault,
+        storage::{
+            Storage, StorageExt, crypto_material::log_storage_success,
+            delete_at_request_and_epoch_id, delete_at_request_id, read_all_data_versioned,
+            read_versioned_at_request_and_epoch_id, read_versioned_at_request_id,
+            store_versioned_at_request_and_epoch_id, store_versioned_at_request_id,
+        },
     },
 };
+
+use kms_grpc::solidity_types::KeygenVerification;
 
 use super::base::CryptoMaterialStorage;
 
@@ -70,39 +80,89 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
         Arc::clone(&self.inner.private_storage)
     }
 
-    /// Write the CRS to the storage backend.
+    /// Write the PRSS info to the storage backend.
+    /// No actions are taken on failure, but the error is returned to the caller for potential handling.
+    pub async fn write_prss_info(
+        &self,
+        epoch_id: &EpochId,
+        prss_info: &PRSSSetupCombined,
+    ) -> anyhow::Result<()> {
+        let mut priv_storage = self.inner.private_storage.lock().await;
+        store_versioned_at_request_id(
+            &mut *priv_storage,
+            &(*epoch_id).into(),
+            prss_info,
+            &PrivDataType::PrssSetupCombined.to_string(),
+        )
+        .await?;
+        log_storage_success(
+            epoch_id,
+            priv_storage.info(),
+            &PrivDataType::PrssSetupCombined.to_string(),
+            false,
+            true,
+        );
+        Ok(())
+    }
+
+    /// Read all PRSS info from storage
+    pub async fn read_all_prss_info(
+        &self,
+    ) -> anyhow::Result<HashMap<RequestId, PRSSSetupCombined>> {
+        let priv_storage = self.inner.private_storage.lock().await;
+
+        read_all_data_versioned(&*priv_storage, &PrivDataType::PrssSetupCombined.to_string()).await
+    }
+
+    /// Write the CRS to the storage backend (for use in connection with resharing).
+    /// Returns true if the write was successful, false otherwise.
+    ///
     /// On failure, the meta_store is used to purge dangling data.
     /// On success, the meta_store is NOT updated; the caller is responsible for that.
-    pub(crate) async fn inner_write_crs<T: Clone>(
+    pub(crate) async fn resharing_crs_write<T: Clone>(
         &self,
         crs_id: &RequestId,
         epoch_id: &EpochId,
         pp: CompactPkeCrs,
         crs_info: CrsGenMetadata,
         meta_store: Arc<RwLock<MetaStore<T>>>,
-    ) {
-        self.inner
-            .inner_write_crs(crs_id, epoch_id, pp, crs_info, meta_store)
+    ) -> bool {
+        if self
+            .inner
+            .inner_write_crs(crs_id, epoch_id, pp, crs_info)
             .await
-    }
-
-    /// Write the CRS to the storage backend as well as the cache,
-    /// and update the [meta_store] to "Done" if the procedure is successful.
-    ///
-    /// When calling this function more than once, the same [meta_store]
-    /// must be used, otherwise the storage state may become inconsistent.
-    pub async fn write_crs_with_meta_store(
-        &self,
-        crs_id: &RequestId,
-        epoch_id: &EpochId,
-        pp: CompactPkeCrs,
-        crs_info: CrsGenMetadata,
-        meta_store: Arc<RwLock<MetaStore<CrsGenMetadata>>>,
-        op_metric_tag: &'static str,
-    ) {
-        self.inner
-            .write_crs_with_meta_store(crs_id, epoch_id, pp, crs_info, meta_store, op_metric_tag)
-            .await
+        {
+            true
+        } else {
+            // Some store op failed, we need to purge any potentially
+            // dangling data and update the meta store accordingly.
+            // Try to delete stored data to avoid anything dangling
+            // Ignore any failure to delete something since it might
+            // be because the data did not get created
+            // In any case, we can't do much.
+            if self.inner.purge_crs_material(crs_id, epoch_id).await {
+                // Successfully purged dangling data, now update meta store with error
+                let mut guarded_meta_store = meta_store.write().await;
+                let _ = update_err_req_in_meta_store(
+                    &mut guarded_meta_store,
+                    crs_id,
+                    format!("Failed to write CRS to storage for epoch change to {epoch_id}"),
+                    OP_NEW_EPOCH,
+                );
+            } else {
+                // Failure in purging data
+                let mut guarded_meta_store = meta_store.write().await;
+                let _ = update_err_req_in_meta_store(
+                    &mut guarded_meta_store,
+                    crs_id,
+                    format!(
+                        "Failed to purge dangling data in connection with CRS update failure for epoch change to {epoch_id}"
+                    ),
+                    OP_NEW_EPOCH,
+                );
+            }
+            false
+        }
     }
 
     /// Check if the CRS under [req_id, epoch_id] exists in the storage.
@@ -118,18 +178,14 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
         threshold_fhe_keys: ThresholdFheKeys,
         fhe_key_set: FhePubKeySet,
         meta_store: Arc<RwLock<MetaStore<T>>>,
-    ) {
+    ) -> bool {
         // use guarded_meta_store as the synchronization point
         // all other locks are taken as needed so that we don't lock up
         // other function calls too much
-        let (r1, r2, r3) = {
+        let (r1, r2) = {
             // Lock the storage components in the correct order to avoid deadlocks.
             let mut pub_storage = self.inner.public_storage.lock().await;
             let mut priv_storage = self.inner.private_storage.lock().await;
-            let back_vault = match self.inner.backup_vault {
-                Some(ref x) => Some(x.lock().await),
-                None => None,
-            };
 
             let f1 = async {
                 let store_result = store_versioned_at_request_and_epoch_id(
@@ -199,44 +255,12 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
                 }
                 pk_result.is_ok() && server_result.is_ok()
             };
-            let threshold_key_clone = threshold_fhe_keys.clone();
-            let f3 = async move {
-                match back_vault {
-                    Some(mut guarded_backup_vault) => {
-                        let backup_result = store_versioned_at_request_and_epoch_id(
-                            &mut (*guarded_backup_vault),
-                            key_id,
-                            epoch_id,
-                            &threshold_key_clone,
-                            &PrivDataType::FheKeyInfo.to_string(),
-                        )
-                        .await;
-
-                        if let Err(e) = &backup_result {
-                            tracing::error!("Failed to store encrypted threshold FHE keys to backup storage for request {key_id}: {e}");
-                        } else {
-                            log_storage_success(
-                                key_id,
-                                guarded_backup_vault.info(),
-                                &PrivDataType::FheKeyInfo.to_string(),
-                                false,
-                                true,
-                            );
-                        }
-                        backup_result.is_ok()
-                    }
-                    None => {
-                        tracing::warn!("No backup vault configured. Skipping backup of key material for request {key_id}");
-                        true
-                    }
-                }
-            };
-            tokio::join!(f1, f2, f3)
+            tokio::join!(f1, f2)
         };
         // Try to store the new data
         tracing::info!("Storing Keys objects for key ID {}", key_id);
 
-        if r1 && r2 && r3 {
+        if r1 && r2 {
             {
                 let mut guarded_fhe_keys = self.fhe_keys.write().await;
                 let previous = guarded_fhe_keys.insert((*key_id, *epoch_id), threshold_fhe_keys);
@@ -250,6 +274,7 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
                 }
             }
             tracing::info!("Finished storing key for Key Id {key_id}.");
+            true
         } else {
             // Try to delete stored data to avoid anything dangling
             // Ignore any failure to delete something since it might be
@@ -262,6 +287,7 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
             let guarded_meta_storage = meta_store.write().await;
             self.purge_key_material(key_id, epoch_id, guarded_meta_storage)
                 .await;
+            false
         }
     }
 
@@ -278,26 +304,29 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
         threshold_fhe_keys: ThresholdFheKeys,
         fhe_key_set: FhePubKeySet,
         meta_store: Arc<RwLock<MetaStore<KeyGenMetadata>>>,
-    ) {
-        let info = threshold_fhe_keys.meta_data.clone();
-        self.inner_write_threshold_keys(
-            key_id,
-            epoch_id,
-            threshold_fhe_keys,
-            fhe_key_set,
-            Arc::clone(&meta_store),
-        )
-        .await;
+    ) -> anyhow::Result<()> {
+        ensure_meta_store_request_pending(&meta_store, key_id).await?;
 
-        // Not much we can do if this fails
-        // Note: it will fail if inner_write_threshold_keys failed
-        let _ = meta_store
-            .write()
-            .await
-            .update(key_id, Ok(info))
-            .inspect_err(|e| {
-                tracing::error!("Error ({}) while updating meta store for {}", e, key_id)
-            });
+        let info = threshold_fhe_keys.meta_data.clone();
+        let storage_ok = self
+            .inner_write_threshold_keys(
+                key_id,
+                epoch_id,
+                threshold_fhe_keys,
+                fhe_key_set,
+                Arc::clone(&meta_store),
+            )
+            .await;
+        if !storage_ok {
+            anyhow::bail!("Storage write failed for threshold key {key_id}");
+        }
+        let mut guarded_meta_store = meta_store.write().await;
+        if let Err(e) = guarded_meta_store.update(key_id, Ok(info)) {
+            self.handle_threshold_meta_update_failure(key_id, epoch_id, guarded_meta_store)
+                .await;
+            anyhow::bail!("Error while updating meta store for {key_id}: {e}");
+        }
+        Ok(())
     }
 
     /// Write the key materials (result of a compressed keygen) to storage and cache
@@ -305,32 +334,56 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
     /// The [meta_store] is updated to "Done" if the procedure is successful.
     ///
     /// This is similar to [write_threshold_keys_with_dkg_meta_store] but for compressed keys.
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_threshold_keys_with_dkg_meta_store_compressed(
         &self,
         key_id: &RequestId,
         epoch_id: &EpochId,
         threshold_fhe_keys: ThresholdFheKeys,
         compressed_keyset: &CompressedXofKeySet,
+        compact_public_key: &tfhe::CompactPublicKey,
         meta_store: Arc<RwLock<MetaStore<KeyGenMetadata>>>,
-    ) {
+    ) -> anyhow::Result<()> {
+        ensure_meta_store_request_pending(&meta_store, key_id).await?;
+
         let info = threshold_fhe_keys.meta_data.clone();
-        self.inner_write_threshold_keys_compressed(
-            key_id,
-            epoch_id,
-            threshold_fhe_keys,
-            compressed_keyset,
-            Arc::clone(&meta_store),
-        )
-        .await;
-        // Not much we can do if this fails
-        // Note: it will fail if inner_write_threshold_keys failed
-        let _ = meta_store
-            .write()
-            .await
-            .update(key_id, Ok(info))
-            .inspect_err(|e| {
-                tracing::error!("Error ({}) while updating meta store for {}", e, key_id)
-            });
+        let storage_ok = self
+            .inner_write_threshold_keys_compressed(
+                key_id,
+                epoch_id,
+                threshold_fhe_keys,
+                compressed_keyset,
+                compact_public_key,
+                Arc::clone(&meta_store),
+            )
+            .await;
+        if !storage_ok {
+            anyhow::bail!("Storage write failed for compressed threshold key {key_id}");
+        }
+        let mut guarded_meta_store = meta_store.write().await;
+        if let Err(e) = guarded_meta_store.update(key_id, Ok(info)) {
+            self.handle_threshold_meta_update_failure(key_id, epoch_id, guarded_meta_store)
+                .await;
+            anyhow::bail!("Error while updating meta store for {key_id}: {e}");
+        }
+        Ok(())
+    }
+
+    async fn handle_threshold_meta_update_failure(
+        &self,
+        key_id: &RequestId,
+        epoch_id: &EpochId,
+        guarded_meta_store: RwLockWriteGuard<'_, MetaStore<KeyGenMetadata>>,
+    ) {
+        if should_purge_after_meta_update_failure(&guarded_meta_store, key_id) {
+            self.purge_key_material(key_id, epoch_id, guarded_meta_store)
+                .await;
+        } else {
+            drop(guarded_meta_store);
+        }
+
+        let mut guarded_fhe_keys = self.fhe_keys.write().await;
+        guarded_fhe_keys.remove(&(*key_id, *epoch_id));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -340,20 +393,17 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
         epoch_id: &EpochId,
         threshold_fhe_keys: ThresholdFheKeys,
         compressed_keyset: &CompressedXofKeySet,
+        compact_public_key: &tfhe::CompactPublicKey,
         meta_store: Arc<RwLock<MetaStore<T>>>,
-    ) {
+    ) -> bool {
         // use guarded_meta_store as the synchronization point
         // all other locks are taken as needed so that we don't lock up
         // other function calls too much
         let guarded_meta_storage = meta_store.write().await;
-        let (r1, r2, r3) = {
+        let (r1, r2) = {
             // Lock the storage components in the correct order to avoid deadlocks.
             let mut pub_storage = self.inner.public_storage.lock().await;
             let mut priv_storage = self.inner.private_storage.lock().await;
-            let back_vault = match self.inner.backup_vault {
-                Some(ref x) => Some(x.lock().await),
-                None => None,
-            };
 
             let f1 = async {
                 let store_result = store_versioned_at_request_and_epoch_id(
@@ -383,8 +433,8 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
                 store_result.is_ok()
             };
             let f2 = async {
-                // Store compressed xof key set
-                let server_result = store_versioned_at_request_id(
+                // Store compressed xof key set and the compact public key derived from it.
+                let keyset_result = store_versioned_at_request_id(
                     &mut (*pub_storage),
                     key_id,
                     compressed_keyset,
@@ -392,7 +442,7 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
                 )
                 .await;
 
-                if let Err(e) = &server_result {
+                if let Err(e) = &keyset_result {
                     tracing::error!(
                         "Failed to store compressed server key for request {}: {}",
                         key_id,
@@ -407,46 +457,35 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
                         true,
                     );
                 }
-                server_result.is_ok()
-            };
-            let threshold_key_clone = threshold_fhe_keys.clone();
-            let f3 = async move {
-                match back_vault {
-                    Some(mut guarded_backup_vault) => {
-                        let backup_result = store_versioned_at_request_and_epoch_id(
-                            &mut (*guarded_backup_vault),
-                            key_id,
-                            epoch_id,
-                            &threshold_key_clone,
-                            &PrivDataType::FheKeyInfo.to_string(),
-                        )
-                        .await;
 
-                        if let Err(e) = &backup_result {
-                            tracing::error!("Failed to store encrypted threshold FHE keys to backup storage for request {key_id}: {e}");
-                        } else {
-                            log_storage_success(
-                                key_id,
-                                guarded_backup_vault.info(),
-                                &PrivDataType::FheKeyInfo.to_string(),
-                                false,
-                                true,
-                            );
-                        }
-                        backup_result.is_ok()
-                    }
-                    None => {
-                        tracing::warn!("No backup vault configured. Skipping backup of key material for request {key_id}");
-                        true
-                    }
+                let pk_result = store_versioned_at_request_id(
+                    &mut (*pub_storage),
+                    key_id,
+                    compact_public_key,
+                    &PubDataType::PublicKey.to_string(),
+                )
+                .await;
+
+                if let Err(e) = &pk_result {
+                    tracing::error!("Failed to store public key for request {}: {}", key_id, e);
+                } else {
+                    log_storage_success(
+                        key_id,
+                        pub_storage.info(),
+                        &PubDataType::PublicKey.to_string(),
+                        true,
+                        true,
+                    );
                 }
+
+                keyset_result.is_ok() && pk_result.is_ok()
             };
-            tokio::join!(f1, f2, f3)
+            tokio::join!(f1, f2)
         };
         // Try to store the new data
         tracing::info!("Storing compressed keys objects for key ID {}", key_id);
 
-        if r1 && r2 && r3 {
+        if r1 && r2 {
             {
                 let mut guarded_fhe_keys = self.fhe_keys.write().await;
                 let previous = guarded_fhe_keys.insert((*key_id, *epoch_id), threshold_fhe_keys);
@@ -463,6 +502,7 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
                 }
             }
             tracing::info!("Finished storing compressed key for Key Id {key_id}.");
+            true
         } else {
             // Try to delete stored data to avoid anything dangling
             // Ignore any failure to delete something since it might be
@@ -474,7 +514,259 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
             );
             self.purge_key_material(key_id, epoch_id, guarded_meta_storage)
                 .await;
+            false
         }
+    }
+
+    /// After a migration keygen (`UseExisting` + `CompressedKeyConfig::All`) stores the
+    /// compressed keyset under `new_key_id`, this function copies it to `old_key_id`
+    /// and replaces the `ThresholdFheKeys` at `(old_key_id, old_epoch_id)` with the
+    /// migrated one, re-signed under `old_key_id`.
+    ///
+    /// The operation is split into validate-then-mutate phases: everything is read
+    /// and checked before any backend is mutated, so a malformed migration input
+    /// cannot leave pub and priv storage in inconsistent states. Once validation
+    /// passes, pub storage, priv storage, backup vault, in-memory cache, and the
+    /// keygen meta-store are all updated under the same held locks so a concurrent
+    /// reader cannot observe a mixed pre/post state.
+    ///
+    /// The old `CompactPublicKey` and `ServerKey` files at `old_key_id` are
+    /// preserved for compatibility. The migration keygen also stores the old
+    /// `CompactPublicKey` at `new_key_id`, so the public key bytes remain
+    /// identical under both IDs. `ServerKey` is retained even though compressed
+    /// metadata does not advertise it, so legacy or direct-storage consumers can
+    /// continue fetching it from the original key id while new flows prefer the
+    /// signed compressed layout.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn copy_compressed_key_to_original(
+        &self,
+        new_key_id: &RequestId,
+        new_epoch_id: &EpochId,
+        old_key_id: &RequestId,
+        old_epoch_id: &EpochId,
+        sk: &PrivateSigKey,
+        eip712_domain: &alloy_sol_types::Eip712Domain,
+        dkg_pubinfo_meta_store: Arc<RwLock<MetaStore<KeyGenMetadata>>>,
+    ) -> anyhow::Result<()> {
+        // Lock order: meta_store -> pub -> priv -> backup -> fhe_keys.
+        let mut guarded_meta_store = dkg_pubinfo_meta_store.write().await;
+        let mut pub_storage = self.inner.public_storage.lock().await;
+        let mut priv_storage = self.inner.private_storage.lock().await;
+        let mut back_vault = match self.inner.backup_vault {
+            Some(ref x) => Some(x.lock().await),
+            None => None,
+        };
+
+        // --- Phase A: validate everything before mutating anything. ---
+
+        // Source of the migrated compressed keyset.
+        let compressed_keyset: CompressedXofKeySet = read_versioned_at_request_id(
+            &*pub_storage,
+            new_key_id,
+            &PubDataType::CompressedXofKeySet.to_string(),
+        )
+        .await?;
+
+        // Source of the migrated ThresholdFheKeys (stored by the keygen at
+        // (new_key_id, new_epoch_id); this may differ from old_epoch_id).
+        let migrated_fhe_keys: ThresholdFheKeys = read_versioned_at_request_and_epoch_id(
+            &*priv_storage,
+            new_key_id,
+            new_epoch_id,
+            &PrivDataType::FheKeyInfo.to_string(),
+        )
+        .await?;
+
+        // Validate that the original key exists before mutating any backend.
+        let _: ThresholdFheKeys = read_versioned_at_request_and_epoch_id(
+            &*priv_storage,
+            old_key_id,
+            old_epoch_id,
+            &PrivDataType::FheKeyInfo.to_string(),
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "No existing ThresholdFheKeys at (old_key_id={old_key_id}, \
+                 old_epoch_id={old_epoch_id:?}): {e}"
+            )
+        })?;
+
+        // Reject LegacyV0 migrated metadata (we can't re-sign without the
+        // structured digest map) and confirm the CompressedXofKeySet digest
+        // is present.
+        let migrated_inner = match &migrated_fhe_keys.meta_data {
+            KeyGenMetadata::Current(inner) => inner,
+            KeyGenMetadata::LegacyV0(_) => {
+                anyhow::bail!(
+                    "Cannot copy compressed key to original: \
+                     migrated ThresholdFheKeys has LegacyV0 metadata"
+                );
+            }
+        };
+        let compressed_digest = migrated_inner
+            .key_digest_map
+            .get(&PubDataType::CompressedXofKeySet)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Migrated ThresholdFheKeys metadata missing CompressedXofKeySet digest"
+                )
+            })?
+            .clone();
+        let public_key_digest = migrated_inner
+            .key_digest_map
+            .get(&PubDataType::PublicKey)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Migrated ThresholdFheKeys metadata missing PublicKey digest")
+            })?
+            .clone();
+
+        // The old PublicKey bytes are intentionally preserved in Phase B, so
+        // verify now that they are present, readable, and match the digest
+        // that will be signed into the migrated metadata.
+        let old_public_key_bytes = pub_storage
+            .load_bytes(old_key_id, &PubDataType::PublicKey.to_string())
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to load raw PublicKey bytes for old keyset {old_key_id}: {e}"
+                )
+            })?;
+        verify_public_key_digest_from_bytes(&old_public_key_bytes, &public_key_digest).map_err(
+            |e| {
+                anyhow::anyhow!(
+                    "PublicKey digest mismatch for old keyset {old_key_id}: {e}; \
+                     expected={}, stored-bytes-hash={}",
+                    hex::encode(&public_key_digest),
+                    hex::encode(hashing::hash_element(
+                        &crate::engine::base::DSEP_PUBDATA_KEY,
+                        &old_public_key_bytes
+                    )),
+                )
+            },
+        )?;
+        let _: tfhe::CompactPublicKey = read_versioned_at_request_id(
+            &*pub_storage,
+            old_key_id,
+            &PubDataType::PublicKey.to_string(),
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to deserialize PublicKey for old keyset {old_key_id}: {e}")
+        })?;
+
+        // Re-sign the metadata under old_key_id, preserving the migrated
+        // extra_data bytes when they exist.
+        let extra_data = migrated_inner.extra_data.clone().unwrap_or_default();
+        let sol_type = KeygenVerification::new_compressed(
+            &migrated_inner.preprocessing_id,
+            old_key_id,
+            compressed_digest,
+            public_key_digest,
+            extra_data.clone(),
+        );
+        let new_signature = compute_eip712_signature(sk, &sol_type, eip712_domain)?;
+        let new_metadata = KeyGenMetadata::new(
+            *old_key_id,
+            migrated_inner.preprocessing_id,
+            migrated_inner.key_digest_map.clone(),
+            new_signature,
+            extra_data,
+        );
+
+        let updated_fhe_keys = ThresholdFheKeys::new(
+            migrated_fhe_keys.private_keys.clone(),
+            migrated_fhe_keys.public_material.clone(),
+            new_metadata.clone(),
+        );
+
+        // --- Phase B: mutate all backends under the held locks. ---
+
+        // Preserve the old PublicKey and ServerKey, and overwrite only the
+        // compressed keyset at the original key ID.
+        delete_at_request_id(
+            &mut *pub_storage,
+            old_key_id,
+            &PubDataType::CompressedXofKeySet.to_string(),
+        )
+        .await?;
+        store_versioned_at_request_id(
+            &mut *pub_storage,
+            old_key_id,
+            &compressed_keyset,
+            &PubDataType::CompressedXofKeySet.to_string(),
+        )
+        .await?;
+
+        // Priv storage at (old_key_id, old_epoch_id): delete + re-store.
+        delete_at_request_and_epoch_id(
+            &mut *priv_storage,
+            old_key_id,
+            old_epoch_id,
+            &PrivDataType::FheKeyInfo.to_string(),
+        )
+        .await?;
+        store_versioned_at_request_and_epoch_id(
+            &mut *priv_storage,
+            old_key_id,
+            old_epoch_id,
+            &updated_fhe_keys,
+            &PrivDataType::FheKeyInfo.to_string(),
+        )
+        .await?;
+
+        // Backup vault (if configured): delete + re-store at the same location
+        // so a restore brings back the migrated keys, not the pre-migration
+        // uncompressed ones.
+        if let Some(vault) = back_vault.as_deref_mut() {
+            delete_at_request_and_epoch_id(
+                vault,
+                old_key_id,
+                old_epoch_id,
+                &PrivDataType::FheKeyInfo.to_string(),
+            )
+            .await?;
+            store_versioned_at_request_and_epoch_id(
+                vault,
+                old_key_id,
+                old_epoch_id,
+                &updated_fhe_keys,
+                &PrivDataType::FheKeyInfo.to_string(),
+            )
+            .await?;
+        } else {
+            tracing::warn!(
+                "No backup vault configured. Skipping backup update during \
+                 copy_compressed_key_to_original for {old_key_id}"
+            );
+        }
+
+        // --- Phase C: refresh dkg_pubinfo_meta_store for old_key_id. ---
+        // `MetaStore::update` only accepts pending entries, so replace the
+        // existing completed entry with delete + insert + update, all under
+        // the meta_store write guard already held since the top of the function.
+        let _ = guarded_meta_store.delete(old_key_id);
+        guarded_meta_store.insert(old_key_id).map_err(|e| {
+            anyhow::anyhow!("Failed to insert {old_key_id} into keygen meta-store: {e}")
+        })?;
+        guarded_meta_store
+            .update(old_key_id, Ok(new_metadata))
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to update {old_key_id} in keygen meta-store: {e}")
+            })?;
+
+        tracing::info!(
+            "Copied compressed key from {new_key_id} to original {old_key_id} \
+             and updated metadata"
+        );
+
+        // In-memory cache.
+        {
+            let mut guarded_fhe_keys = self.fhe_keys.write().await;
+            guarded_fhe_keys.insert((*old_key_id, *old_epoch_id), updated_fhe_keys);
+        }
+
+        Ok(())
     }
 
     /// Read the key materials for decryption in the threshold case.
@@ -539,7 +831,6 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
     }
 
     /// Tries to delete all the types of key material related to a specific [RequestId] and [EpochId].
-    /// WARNING: This also deletes the BACKUP of the keys. Hence the method should should only be used as cleanup after a failed DKG.
     pub async fn purge_key_material<T: Clone>(
         &self,
         req_id: &RequestId,
@@ -548,19 +839,6 @@ impl<PubS: Storage + Send + Sync + 'static, PrivS: StorageExt + Send + Sync + 's
     ) {
         self.inner
             .purge_key_material(req_id, epoch_id, KMSType::Threshold, guarded_meta_store)
-            .await
-    }
-
-    /// Tries to delete all the types of CRS material related to a specific [RequestId].
-    /// WARNING: This also deletes the BACKUP of the CRS data. Hence the method should should only be used as cleanup after a failed CRS generation.
-    pub async fn purge_crs_material(
-        &self,
-        req_id: &RequestId,
-        epoch_id: &EpochId,
-        guarded_meta_store: RwLockWriteGuard<'_, MetaStore<CrsGenMetadata>>,
-    ) {
-        self.inner
-            .purge_crs_material(req_id, epoch_id, guarded_meta_store)
             .await
     }
 

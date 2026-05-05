@@ -1,7 +1,8 @@
-CLAUDE.md
-.claude/
+.claude/settings.local.json
+./CLAUDE.local.md
+.codex
 /target*
-/temp
+**/temp/*
 /keys
 /crs
 /test-material
@@ -12,7 +13,6 @@ CLAUDE.md
 .vscode/launch.json
 .DS_Store
 .vscode/
-.claude
 .idea/
 *.eif
 .crates.toml
@@ -40,3 +40,7 @@ ci/kube-testing/certs/
 
 # Local values files for Kind testing
 ci/kube-testing/kms/local-values-*.yaml
+
+.mcp.json
+.fastembed*
+core/grpc/proto/buf.yaml

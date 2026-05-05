@@ -5,7 +5,16 @@ members = [
     "bc2wrap",
     "core/grpc",
     "core/service",
-    "core/threshold",
+    "core/test-utils",
+    "core/thread-handles",
+    "core/experiments",
+    "core/threshold-algebra",
+    "core/threshold-execution",
+    "core/threshold-bgv",
+    "core/threshold-hashing",
+    "core/threshold-networking",
+    "core/threshold-types",
+    "core/error-utils",
     "core-client",
     "observability",
     "tools/kms-health-check",
@@ -19,6 +28,7 @@ members = [
 # backward-compatibility/generate-v0.11.1 - Data generation for v0.11.1 with old KMS version dependencies
 # backward-compatibility/generate-v0.13.0 - Data generation for v0.13.0 with old KMS version dependencies
 # backward-compatibility/generate-v0.13.10 - Data generation for v0.13.10 with old KMS version dependencies
+# backward-compatibility/generate-v0.13.20 - Data generation for v0.13.20 with old KMS version dependencies
 #
 # The generate crates need to import old KMS versions (e.g., v0.11.0, v0.11.1) which conflict with the
 # current workspace dependencies, creating name conflicts as described in:
@@ -27,14 +37,14 @@ members = [
 # Note: It's not possible to only generate the lock file using specific features as the resolver
 # builds the graph as if all features are enabled:
 # https://doc.rust-lang.org/cargo/reference/resolver.html#features
-exclude = ["backward-compatibility", "backward-compatibility/generate-v0.11.0", "backward-compatibility/generate-v0.11.1", "backward-compatibility/generate-v0.13.0", "backward-compatibility/generate-v0.13.10"]
+exclude = ["backward-compatibility", "backward-compatibility/generate-v0.11.0", "backward-compatibility/generate-v0.11.1", "backward-compatibility/generate-v0.13.0", "backward-compatibility/generate-v0.13.10", "backward-compatibility/generate-v0.13.20"]
 
 [workspace.package]
 authors = ["Zama"]
 publish = true
-edition = "2021"
+edition = "2024"
 license = "BSD-3-Clause-Clear"
-version = "0.13.10-rc.0"
+version = "0.13.20-0"
 repository = "https://github.com/zama-ai/kms"
 description = "Key Management System for the Zama Protocol."
 
@@ -66,13 +76,22 @@ description = "Key Management System for the Zama Protocol."
 # MAINTAIN ALPHABETICAL ORDER for all dependencies within each section
 
 # Internal Zama modules
+algebra = { package = "threshold-algebra", path = "./core/threshold-algebra", default-features = false }
 backward-compatibility = { path = "./backward-compatibility" }  # Internal backward compatibility testing
 bc2wrap = { path = "./bc2wrap" }  # Internal bincode wrapper custom implementation
+error-utils = { path = "./core/error-utils", default-features = false }
+threshold-execution = { path = "./core/threshold-execution", default-features = false }
+threshold-bgv = { path = "./core/threshold-bgv", default-features = false }
+hashing = { package = "threshold-hashing", path = "./core/threshold-hashing", default-features = false }
 kms = { path = "./core/service", default-features = false }  # Core KMS service
 kms-core-client = { path = "./core-client" }  # Core KMS client library
 kms-grpc = { path = "./core/grpc", default-features = false }  # KMS gRPC interface
+threshold-networking = { path = "./core/threshold-networking", default-features = false }
 observability = { path = "./observability" }  # Internal observability module
-threshold-fhe = { path = "./core/threshold/", default-features = false }  # Threshold FHE implementation
+test-utils = { path = "./core/test-utils" }
+experiments = { path = "./core/experiments/", default-features = false }  # Threshold FHE experiments
+threshold-types = { path = "./core/threshold-types" } # Types share across the KMS
+thread-handles = { path = "./core/thread-handles" }
 
 # External dependencies (alphabetically sorted)
 aes = "=0.8.4"  # AES encryption - LOW RISK: RustCrypto org, very popular (135M+ downloads), actively maintained
@@ -114,14 +133,13 @@ const_format = "=0.2.34"  # Compile-time string formatting - HIGH RISK: Individu
 console_error_panic_hook = { version = "=0.1.7" }  # WASM panic hook for better error messages - LOW RISK: rustwasm team
 criterion = { version = "=0.5.1", features = ["async_tokio"] }  # Benchmarking framework - MEDIUM RISK: Individual maintainers (bheisler, lemmih, rust-bus), despite 120M+ downloads, test-only dependency
 crypto-bigint = { version = "=0.6.1", features = ["serde", "rand_core", "extra-sizes"] }  # Big integer operations for crypto - LOW RISK: RustCrypto org
-ctor = "=0.4.2"  # Constructor functions - HIGH RISK: Individual maintainer (mmastrac), test-only dependency
 dashmap = "=6.1.0"  # Concurrent hashmap - HIGH RISK: Individual maintainer (xacrimon), despite 156M+ downloads
 derive_more = { version = "=2.0.1", features = ["display"] }  # Derive macros for common traits - HIGH RISK: Individual maintainer (JelteF), despite 180M+ downloads
 enum_dispatch = "=0.3.13"  # Enum dispatch optimization - HIGH RISK: Individual maintainer (Anton Lazarev), despite 29M+ downloads
 futures = "=0.3.31"  # Async futures - LOW RISK: rust-lang team
 futures-util = "=0.3.31"  # Futures utilities - LOW RISK: rust-lang team
 g2p = "=1.2.2"  # Galois field arithmetic (GF(2^p)) - LOW RISK: Essential for threshold cryptography, finite field operations
-getrandom = { version = "=0.2.15", features = ["js"] }  # Random number generation for WASM - LOW RISK: rust-random team
+getrandom = { version = "=0.2.17", features = ["js"] }  # Random number generation for WASM - LOW RISK: rust-random team
 hex = "=0.4.3"  # Hex encoding/decoding - HIGH RISK: Individual maintainer (KokaKiwi), despite 284M downloads
 http = "=1.3.1"  # HTTP types - LOW RISK: hyperium team, 100M+ downloads
 http-legacy = { package = "http", version = "=0.2.12" }  # HTTP types (older version for compatibility) - LOW RISK: hyperium team
@@ -130,7 +148,6 @@ hyper-rustls-ring = { package = "hyper-rustls", version = "=0.27.7", default-fea
 iam-rs = { version = "=0.0.23" } # AWS IAM policy parser/generator - HIGH RISK: individual maintainer, 10K downloads
 itertools = "=0.14.0"  # Iterator utilities - LOW RISK: bluss/rust-itertools, 100M+ downloads
 k256 = "=0.13.4"  # secp256k1 elliptic curve - LOW RISK: RustCrypto org, 33M+ downloads
-lazy_static = "=1.5.0"  # Lazy static initialization - LOW RISK: rust-lang-nursery, 100M+ downloads
 minijinja = { version = "=2.11.0", features = ["loader"] }  # Template engine - HIGH RISK: Individual maintainer (mitsuhiko), despite exceptional track record
 ml-kem = { version = "=0.2.2", features = ["zeroize"] }  # ML-KEM (Kyber) post-quantum KEM - MEDIUM RISK: New standard implementation, needs security audit
 mockall = "=0.13.1"  # Mocking for tests - HIGH RISK: Individual maintainer (asomers), test-only dependency
@@ -139,13 +156,12 @@ nom = "=8.0.0"  # Parser combinator library - HIGH RISK: Individual maintainer (
 num-integer = "=0.1.46"  # Integer utilities - LOW RISK: rust-num team
 num-traits = "=0.2.19"  # Numeric traits - LOW RISK: rust-num team
 oid-registry = "=0.8.1"  # OID registry for ASN.1 - LOW RISK: rusticata team
-opentelemetry = "=0.29.1"  # OpenTelemetry observability - LOW RISK: CNCF project, well-maintained
-opentelemetry-http = "=0.29.0"  # OpenTelemetry HTTP transport - LOW RISK: CNCF project
-opentelemetry-otlp = { version = "=0.29.0", features = ["tokio", "grpc-tonic"] }  # OpenTelemetry OTLP exporter - LOW RISK: CNCF project, standard protocol
-opentelemetry-prometheus = "=0.29.1"  # Prometheus metrics exporter - LOW RISK: CNCF project
-opentelemetry-semantic-conventions = "=0.29.0"  # Semantic conventions - LOW RISK: CNCF project, standard definitions
-opentelemetry-stdout = { version = "=0.29.0", features = ["trace"] }  # Stdout exporter for debugging - LOW RISK: CNCF project
-opentelemetry_sdk = { version = "=0.29.0", features = ["rt-tokio", "logs", "metrics"] }  # OpenTelemetry SDK - LOW RISK: CNCF project, core functionality
+opentelemetry = "=0.31.0"  # OpenTelemetry observability - LOW RISK: CNCF project, well-maintained
+opentelemetry-http = "=0.31.0"  # OpenTelemetry HTTP transport - LOW RISK: CNCF project
+opentelemetry-otlp = { version = "=0.31.0", features = ["tokio", "grpc-tonic"] }  # OpenTelemetry OTLP exporter - LOW RISK: CNCF project, standard protocol
+opentelemetry-semantic-conventions = "=0.31.0"  # Semantic conventions - LOW RISK: CNCF project, standard definitions
+opentelemetry-stdout = { version = "=0.31.0", features = ["trace"] }  # Stdout exporter for debugging - LOW RISK: CNCF project
+opentelemetry_sdk = { version = "=0.31.0", features = ["rt-tokio", "logs"] }  # OpenTelemetry SDK - LOW RISK: CNCF project, core functionality
 p384 = "=0.13.1" # secp384r1 elliptic curvi - LOW RISK: RustCrypto org, 27M+ downloads
 paste = "=1.0"  # Token pasting macros -  MEDIUM RISK: Reputable individual maintainer (dtolnay), 251M+ downloads
 peak_alloc = { version = "=0.2.1" }  # Memory allocation tracker - HIGH RISK: Individual maintainer (Imberflur), low popularity, 251K downloads
@@ -153,11 +169,11 @@ pprof = { version = "=0.15.0", features = ["flamegraph", "criterion"] }  # CPU p
 proc-macro2 = "=1.0.101"  # Proc macro utilities - MEDIUM RISK: Reputable individual maintainer (dtolnay), 740M downloads
 prometheus = { version = "=0.14.0", features = ["process"] }  # Prometheus metrics client - LOW RISK: tikv team, 1M+ downloads
 proptest = "=1.6.0"  # Property-based testing - MEDIUM RISK: Individual maintainers (AltSysrq, Centril), test-only dependency
-prost = "=0.13.5"  # Protocol Buffers - LOW RISK: tokio-rs team, 10M+ downloads
+prost = "=0.14.3"  # Protocol Buffers - LOW RISK: tokio-rs team, 10M+ downloads
 quote = "=1.0.40"  # Quote macro utilities - MEDIUM RISK: Reputable individual maintainer (dtolnay), 722M downloads
 rand = "=0.8.5"  # Random number generation - LOW RISK: rust-random, 100M+ downloads
-rasn = "=0.20.2"  # ASN.1 encoding/decoding - HIGH RISK: Individual maintainer (XAMPPRocky), security-critical ASN.1 handling
-rasn-cms = "=0.20.2"  # CMS (Cryptographic Message Syntax) - HIGH RISK: Individual maintainer (XAMPPRocky), security-critical
+rasn = "=0.28.11"  # ASN.1 encoding/decoding - HIGH RISK: Individual maintainer (XAMPPRocky), security-critical ASN.1 handling
+rasn-cms = "=0.28.11"  # CMS (Cryptographic Message Syntax) - HIGH RISK: Individual maintainer (XAMPPRocky), security-critical
 rayon = "=1.11.0"  # Data parallelism - LOW RISK: rayon-rs team
 rcgen = { version = "=0.14.7", default-features = false, features = ["aws_lc_rs", "crypto", "pem", "x509-parser"] }  # X.509 certificate generation - MEDIUM RISK: Using custom fork (see patch section), needs verification
 redis = { version = "=0.29.5" }  # Redis client - LOW RISK: redis-rs team
@@ -180,31 +196,32 @@ syn = { version = "2.0", features = ["full"] }  # Syn macro parsing - MEDIUM RIS
 sysinfo = "0.36.1"  # System information gathering - MEDIUM RISK: Reputable individual maintainer (GuillaumeGomez), 71M+ downloads
 tempfile = "=3.20.0"  # Temporary file handling - MEDIUM RISK: Individual maintainers (Stebalien, KodrAus), 345M+ downloads, test-only dependency
 test-context = "=0.4.1"  # Test context utilities - MEDIUM RISK: Individual maintainers (markhildreth, JasperV), test-only dependency
-tfhe = "=1.5.4"  # Fully Homomorphic Encryption library - LOW RISK: Zama
-tfhe-csprng = "=0.8.1"  # Cryptographically secure PRNG for TFHE - LOW RISK: Zama
+tfhe = "=1.6.1"  # Fully Homomorphic Encryption library - LOW RISK: Zama
+tfhe-csprng = "=0.9.0"  # Cryptographically secure PRNG for TFHE - LOW RISK: Zama
 tfhe-versionable = "=0.7.0"  # TFHE versioning support - LOW RISK: Zama
-tfhe-zk-pok = "=0.8.0"  # Zero-knowledge proofs for TFHE - LOW RISK: Zama
+tfhe-zk-pok = "=0.8.1"  # Zero-knowledge proofs for TFHE - LOW RISK: Zama
 thiserror = "=2.0.12"  # Error derive macro - MEDIUM RISK: Reputable individual maintainer (dtolnay), 545M downloads
 tokio = { version = "=1.49.0", features = ["full"] }  # Async runtime - LOW RISK: tokio team, industry standard
 tokio-rustls = { version = "=0.26.2", default-features = false, features = ["aws_lc_rs"] }  # Async TLS - LOW RISK: rustls team, memory-safe TLS implementation
 tokio-util = { version = "=0.7.18", features = ["rt"] }  # Tokio utilities - LOW RISK: tokio team
-tonic = "=0.13.1"  # gRPC framework - LOW RISK: hyperium team
-tonic-build = "=0.13.1"  # gRPC code generation - LOW RISK: hyperium team
-tonic-health = "=0.13.1"  # gRPC health checking - LOW RISK: hyperium team
-tonic-tls = "=0.3.0"  # TLS support for tonic - LOW RISK: hyperium team
+toml = "=0.9.11"  # TOML serialization for tests and tooling - LOW RISK: rust-lang maintained, widely used
+tonic = "=0.14.5"  # gRPC framework - LOW RISK: hyperium team
+tonic-health = "=0.14.5"  # gRPC health checking - LOW RISK: hyperium team
+tonic-prost = "=0.14.5"  # prost codec for tonic gRPC - LOW RISK: hyperium team
+tonic-prost-build = "=0.14.5"  # gRPC code generation with prost - LOW RISK: hyperium team
+tonic-tls = { version = "=0.6.1", features = ["rustls"] }  # TLS support for tonic - MEDIUM RISK: single developer
 tower = "=0.5.3"  # Service framework - LOW RISK: tower-rs team
 tower-http = "=0.6.8"  # HTTP middleware - LOW RISK: tower-rs team
 tracing = { version = "=0.1.44", features = ["log"] }  # Application instrumentation - LOW RISK: tokio-rs team
 tracing-appender = "=0.2.3"  # Log file rotation - LOW RISK: tokio-rs team
-tracing-opentelemetry = "=0.30.0"  # OpenTelemetry integration - LOW RISK: tokio-rs team
-tracing-subscriber = { version = "=0.3.20", features = ["fmt", "std"] }  # Tracing subscriber - LOW RISK: tokio-rs team
-tracing-test = "=0.2.5"  # Tracing test utilities - LOW RISK: tokio-rs team
+tracing-opentelemetry = "=0.32.1"  # OpenTelemetry integration - LOW RISK: tokio-rs team
+tracing-subscriber = { version = "=0.3.22", features = ["fmt", "std"] }  # Tracing subscriber - LOW RISK: tokio-rs team
 trait-variant = "0.1.2"  # Trait variant generation - LOW RISK: rust-lang team utility
 typed-builder = "=0.21.0"  # Builder pattern macro - HIGH RISK: Individual maintainer (idanarye), despite 48M+ downloads
 url = { version = "=2.5.8", features = ["serde"] }  # URL parsing and manipulation - LOW RISK: servo team,
 uuid = { version = "=1.19.0", features = ["v4", "fast-rng"] }  # UUID generation - LOW RISK: uuid-rs team
 validator = { version = "=0.20.0", features = ["derive"] }  # Struct validation - HIGH RISK: Individual maintainer (Keats), less active maintenance
-wasm-bindgen = { version = "=0.2.108", features = ["serde-serialize"] }  # WASM bindings - LOW RISK: rustwasm team
+wasm-bindgen = { version = "=0.2.114", features = ["serde-serialize"] }  # WASM bindings - LOW RISK: rustwasm team
 x509-parser = { version = "=0.18.0", features = ["verify-aws"] }  # X.509 certificate parsing - LOW RISK: rusticata team
 zeroize = { version = "=1.8.2", features = ["zeroize_derive"] }  # Secure memory wiping - LOW RISK: RustCrypto org, critical for key management
 
@@ -224,9 +241,16 @@ opt-level = 3
 opt-level = 1
 # Ensure all possible speed ups on dev compilation on Macos is enabled
 split-debuginfo = "unpacked"
+# Cut down memory consumption and speed up compilation a bit.
+debug = "line-tables-only"
 
 [profile.test]
 opt-level = 3
+lto = "off"
+# Ensure all possible speed ups on dev compilation on Macos is enabled
+split-debuginfo = "unpacked"
+# Cut down memory consumption and speed up compilation a bit (downside: no variable inspection in a debugger).
+debug = "line-tables-only"
 
 [profile.bench]
 debug = true
